@@ -1,0 +1,6 @@
+wandb/
+*.wandb
+Main/logs/
+*.log
+Main/workspace/
+Main/slurmfiles/
