@@ -4,3 +4,4 @@ Main/logs/
 *.log
 Main/workspace/
 Main/slurmfiles/
+**/__pycache__/
