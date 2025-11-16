@@ -11,26 +11,95 @@ import matplotlib.pyplot as plt
 from sklearn.mixture import GaussianMixture
 
 
+def log_strategy_action(message: str):
+    print(f"[STRATEGY] {message}", flush=True)
+
+
 class ActiveLearningStrategy:
-    def __init__(self, args, cycle: int, data_root, split: str, rng_seed: int = 784) -> None:
+    def __init__(self, args, cycle: int, data_root, split: str, idx_root=None, rng_seed: int = 784) -> None:
         self.data_root = data_root
+        self.idx_root = idx_root or osp.join(self.data_root, "Idx_files")
         self.job_name = getattr(args, "job_name", "run")
         self.split = split
         self.strategy = getattr(args, "strategy", "coreset")
         self.cycle = int(cycle)
-        self.train_pool_idx = np.load(osp.join(self.data_root, f"{split}.npy")).astype(int)
+        self.train_pool_idx = self._load_idx(split)
+        self.preseed_idx = self._load_idx("preseed_idx", required=False)
         self.train_current_idx = np.empty(0, dtype=int)
         if self.cycle > 0:
-            prev_stem = f"{self.job_name}_{self.split}_cycle{self.cycle-1}_strategy_{self.strategy}.npy"
-            prev_path = osp.join(self.data_root, prev_stem)
+            prev_stem = f"{self.job_name}_cycle{self.cycle-1}"
+            prev_path = self._idx_path(prev_stem)
             if osp.exists(prev_path):
                 self.train_current_idx = np.load(prev_path).astype(int)
         self.rng_seed = int(rng_seed)
         self.rng = np.random.default_rng(self.rng_seed + self.cycle)
+        log_strategy_action(
+            f"{self.job_name} cycle {self.cycle}: strategy={self.strategy}, "
+            f"pool={self.train_pool_idx.size}, preseed={self.preseed_idx.size}, "
+            f"current={self.train_current_idx.size}"
+        )
+
+    def _idx_path(self, name: str) -> str:
+        fname = name if name.endswith(".npy") else f"{name}.npy"
+        return osp.join(self.idx_root, fname)
+
+    def _load_idx(self, name: str, required: bool = True) -> np.ndarray:
+        path = self._idx_path(name)
+        if not osp.exists(path):
+            if required:
+                raise FileNotFoundError(path)
+            return np.empty(0, dtype=int)
+        data = np.load(path).astype(int)
+        log_strategy_action(f"Loaded index file {path} with {data.size} entries.")
+        return data
+
+    def _seed_indices(self) -> np.ndarray:
+        parts = []
+        if self.train_current_idx.size > 0:
+            parts.append(self.train_current_idx.astype(int))
+        if self.preseed_idx.size > 0:
+            parts.append(self.preseed_idx.astype(int))
+        if not parts:
+            return np.empty(0, dtype=int)
+        return np.unique(np.concatenate(parts, axis=0))
+
+    def _ensure_preseed(self, idx: np.ndarray) -> np.ndarray:
+        if (
+            self.cycle == 0
+            and self.preseed_idx.size > 0
+            and self.strategy not in ("preseed", "full")
+        ):
+            if idx.size == 0:
+                return self.preseed_idx.astype(int)
+            return np.unique(np.concatenate([idx.astype(int), self.preseed_idx.astype(int)]))
+        return idx
+
+    def _seed_embeddings(self, encoder, device, tform):
+        seed_idx = self._seed_indices()
+        if seed_idx.size == 0:
+            return None
+        emb_list = [
+            self._pair_embedding_scale1(encoder, device, tform, *self._idx_to_paths(int(i))) for i in seed_idx
+        ]
+        seed_embs = torch.stack(emb_list, dim=0).float()
+        seed_embs = seed_embs / (seed_embs.norm(dim=1, keepdim=True) + 1e-8)
+        return seed_embs
+
+    def _seed_embeddings_raw(self, encoder, device, tform):
+        seed_idx = self._seed_indices()
+        if seed_idx.size == 0:
+            return None
+        emb_list = [
+            self._pair_embedding_raw(encoder, device, tform, *self._idx_to_paths(int(i))) for i in seed_idx
+        ]
+        seed_embs = torch.stack(emb_list, dim=0).float()
+        return seed_embs
 
     def _budget_for_cycle(self) -> int:
         schedule = {0: 10, 1: 20, 2: 40}
-        return int(schedule.get(self.cycle, list(schedule.values())[-1]))
+        budget = int(schedule.get(self.cycle, list(schedule.values())[-1]))
+        log_strategy_action(f"Budget for cycle {self.cycle}: {budget} samples.")
+        return budget
 
     def remaining(self) -> np.ndarray:
         return np.setdiff1d(self.train_pool_idx, self.train_current_idx, assume_unique=False)
@@ -129,6 +198,7 @@ class ActiveLearningStrategy:
             return np.empty(0, dtype=int)
         k = min(int(k), avail.size)
         idx = self.rng.choice(avail, size=k, replace=False)
+        log_strategy_action(f"Random strategy picked {idx.size} indices out of {avail.size} available.")
         return idx.astype(int)
 
     @torch.no_grad()
@@ -279,16 +349,7 @@ class ActiveLearningStrategy:
         Ht = getattr(model_for_uncertainty, "h_resized", 14 * 8 * 5)
         Wt = getattr(model_for_uncertainty, "w_resized", 14 * 8 * 5)
         tform = get_tuple_transform_ops(resize=(Ht, Wt), normalize=True, clahe=False)
-        initial_seed_idx = np.array([15, 37, 98, 114, 137, 141, 142, 182, 194, 195], dtype=int)
-        if self.train_current_idx.size > 0:
-            all_seed_idx = np.unique(np.concatenate([self.train_current_idx.astype(int), initial_seed_idx], axis=0))
-        else:
-            all_seed_idx = initial_seed_idx
-        seed_embs = torch.stack(
-            [self._pair_embedding_scale1(encoder, device, tform, *self._idx_to_paths(int(i))) for i in all_seed_idx],
-            dim=0,
-        ).float()
-        seed_embs = seed_embs / (seed_embs.norm(dim=1, keepdim=True) + 1e-8)
+        seed_embs = self._seed_embeddings(encoder, device, tform)
         cand_embs = torch.stack(
             [self._pair_embedding_scale1(encoder, device, tform, *self._idx_to_paths(int(i))) for i in avail],
             dim=0,
@@ -308,15 +369,7 @@ class ActiveLearningStrategy:
         Ht = getattr(model_for_uncertainty, "h_resized", 14 * 8 * 5)
         Wt = getattr(model_for_uncertainty, "w_resized", 14 * 8 * 5)
         tform = get_tuple_transform_ops(resize=(Ht, Wt), normalize=True, clahe=False)
-        initial_seed_idx = np.array([15, 37, 98, 114, 137, 141, 142, 182, 194, 195], dtype=int)
-        if self.train_current_idx.size > 0:
-            all_seed_idx = np.unique(np.concatenate([self.train_current_idx.astype(int), initial_seed_idx], axis=0))
-        else:
-            all_seed_idx = initial_seed_idx
-        seed_embs = torch.stack(
-            [self._pair_embedding_raw(encoder, device, tform, *self._idx_to_paths(int(i))) for i in all_seed_idx],
-            dim=0,
-        ).float()
+        seed_embs = self._seed_embeddings_raw(encoder, device, tform)
         cand_embs = torch.stack(
             [self._pair_embedding_raw(encoder, device, tform, *self._idx_to_paths(int(i))) for i in avail],
             dim=0,
@@ -381,16 +434,7 @@ class ActiveLearningStrategy:
             dim=0,
         ).float()
         cand_embs = cand_embs / (cand_embs.norm(dim=1, keepdim=True) + 1e-8)
-        initial_seed_idx = np.array([15, 37, 98, 114, 137, 141, 142, 182, 194, 195], dtype=int)
-        if self.train_current_idx.size > 0:
-            all_seed_idx = np.unique(np.concatenate([self.train_current_idx.astype(int), initial_seed_idx], axis=0))
-        else:
-            all_seed_idx = initial_seed_idx
-        seed_embs = torch.stack(
-            [self._pair_embedding_scale1(encoder, device, tform, *self._idx_to_paths(int(j))) for j in all_seed_idx],
-            dim=0,
-        ).float()
-        seed_embs = seed_embs / (seed_embs.norm(dim=1, keepdim=True) + 1e-8)
+        seed_embs = self._seed_embeddings(encoder, device, tform)
         hs_vals = []
         for i in avail:
             a_path, b_path = self._idx_to_paths(int(i))
@@ -484,15 +528,7 @@ class ActiveLearningStrategy:
         Ht = getattr(model_for_uncertainty, "h_resized", 14 * 8 * 5)
         Wt = getattr(model_for_uncertainty, "w_resized", 14 * 8 * 5)
         tform = get_tuple_transform_ops(resize=(Ht, Wt), normalize=True, clahe=False)
-        initial_seed_idx = np.array([15, 37, 98, 114, 137, 141, 142, 182, 194, 195], dtype=int)
-        if self.train_current_idx.size > 0:
-            all_seed_idx = np.unique(np.concatenate([self.train_current_idx.astype(int), initial_seed_idx], axis=0))
-        else:
-            all_seed_idx = initial_seed_idx
-        seed_embs = torch.stack(
-            [self._pair_embedding_raw(encoder, device, tform, *self._idx_to_paths(int(i))) for i in all_seed_idx],
-            dim=0,
-        ).float()
+        seed_embs = self._seed_embeddings_raw(encoder, device, tform)
         cand_embs = torch.stack(
             [self._pair_embedding_raw(encoder, device, tform, *self._idx_to_paths(int(i))) for i in avail],
             dim=0,
@@ -551,36 +587,50 @@ class ActiveLearningStrategy:
     def promote(self, new_idx: np.ndarray) -> None:
         new_idx = np.asarray(new_idx, dtype=int)
         if new_idx.size == 0:
+            log_strategy_action(f"No new indices to promote for {self.job_name} cycle {self.cycle}.")
             return
         self.train_current_idx = np.unique(np.concatenate([self.train_current_idx, new_idx]))
+        log_strategy_action(
+            f"Promoted {new_idx.size} indices; total labeled set now {self.train_current_idx.size}."
+        )
 
     def get_train_idx(self, model_for_uncertainty=None) -> str:
-        k = self._budget_for_cycle()
-        if self.strategy == "random":
-            new_idx = self.random(k=k)
-        elif self.strategy == "coreset" and model_for_uncertainty is not None:
-            new_idx = self.coreset(model_for_uncertainty, k=k)
-        elif self.strategy == "coreset2" and model_for_uncertainty is not None:
-            new_idx = self.coreset2(model_for_uncertainty, k=k)
-        elif self.strategy == "roma_homography_stability" and model_for_uncertainty is not None:
-            new_idx = self.roma_homography_stability(model_for_uncertainty, k=k)
-        elif self.strategy == "kcenter_uncertainty_weighted" and model_for_uncertainty is not None:
-            new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k, lambda_u=1.0)
-        elif self.strategy == "adaptive_homog_uwe" and model_for_uncertainty is not None:
-            new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k)
-        elif self.strategy == "dpp" and model_for_uncertainty is not None:
-            new_idx = self.dpp(model_for_uncertainty, k=k)
-        elif self.strategy == "weighted_tau_dpp" and model_for_uncertainty is not None:
-            new_idx = self.weighted_tau_dpp(model_for_uncertainty, k=k)
-        elif self.strategy == "weighted_dpp_tau1" and model_for_uncertainty is not None:
-            new_idx = self.weighted_dpp_tau1(model_for_uncertainty, k=k)
-        elif self.strategy == "tau_weighted_embedding" and model_for_uncertainty is not None:
-            new_idx = self.tau_weighted_embedding(model_for_uncertainty, k=k)
+        if self.strategy == "full":
+            new_idx = self.train_pool_idx.astype(int)
+        elif self.strategy == "preseed":
+            if self.preseed_idx.size == 0:
+                raise ValueError("preseed_idx.npy missing")
+            new_idx = self.preseed_idx.astype(int)
         else:
-            raise ValueError("strategy requires model_for_uncertainty")
+            k = self._budget_for_cycle()
+            log_strategy_action(f"Running {self.strategy} strategy with budget {k}.")
+            if self.strategy == "random":
+                new_idx = self.random(k=k)
+            elif self.strategy == "coreset" and model_for_uncertainty is not None:
+                new_idx = self.coreset(model_for_uncertainty, k=k)
+            elif self.strategy == "coreset2" and model_for_uncertainty is not None:
+                new_idx = self.coreset2(model_for_uncertainty, k=k)
+            elif self.strategy == "roma_homography_stability" and model_for_uncertainty is not None:
+                new_idx = self.roma_homography_stability(model_for_uncertainty, k=k)
+            elif self.strategy in ("kcenter_uncertainty_weighted", "k_center_greedy_uncertainty") and model_for_uncertainty is not None:
+                new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k, lambda_u=1.0)
+            elif self.strategy == "adaptive_homog_uwe" and model_for_uncertainty is not None:
+                new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k)
+            elif self.strategy == "dpp" and model_for_uncertainty is not None:
+                new_idx = self.dpp(model_for_uncertainty, k=k)
+            elif self.strategy == "weighted_tau_dpp" and model_for_uncertainty is not None:
+                new_idx = self.weighted_tau_dpp(model_for_uncertainty, k=k)
+            elif self.strategy == "weighted_dpp_tau1" and model_for_uncertainty is not None:
+                new_idx = self.weighted_dpp_tau1(model_for_uncertainty, k=k)
+            elif self.strategy == "tau_weighted_embedding" and model_for_uncertainty is not None:
+                new_idx = self.tau_weighted_embedding(model_for_uncertainty, k=k)
+            else:
+                raise ValueError("strategy requires model_for_uncertainty")
+            new_idx = self._ensure_preseed(new_idx)
         self.promote(new_idx)
-        stem = f"{self.job_name}_{self.split}_cycle{self.cycle}_strategy_{self.strategy}"
-        out_path = osp.join(self.data_root, f"{stem}.npy")
-        os.makedirs(self.data_root, exist_ok=True)
+        stem = f"{self.job_name}_cycle{self.cycle}"
+        out_path = self._idx_path(stem)
+        os.makedirs(self.idx_root, exist_ok=True)
         np.save(out_path, self.train_current_idx.astype(int))
+        log_strategy_action(f"Saved updated indices to {out_path}.")
         return stem

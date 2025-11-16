@@ -5,3 +5,5 @@ Main/logs/
 Main/workspace/
 Main/slurmfiles/
 **/__pycache__/
+*.err
+*.out
