@@ -7,3 +7,7 @@ Main/slurmfiles/
 **/__pycache__/
 *.err
 *.out
+**.pyc
+**.png
+**.jpg
+**.csv

@@ -1,7 +1,7 @@
 import numpy as np
 import os
 
-path = "/home/abhiram001/active_learning/abhiram/AMD_ab/datasets/cross_modality/Optical-Depth/Depth_Tau_UWE_New_train_idx_cycle1_strategy_adaptive_homog_uwe.npy"
+path = "/home/abhiram001/Active_Learning_Multimodal_Image_Matching/Active-Learning-for-Dense-Image-Matching-/datasets/cross_modality/Nighttime/Idx_files/Nighttime_random_cycle2.npy"
 
 arr = np.load(path)  # add allow_pickle=True ONLY if it was saved with pickled objects
 

@@ -2,7 +2,6 @@
 
 import os, os.path as osp, numpy as np, torch, cv2
 from PIL import Image
-from scipy.stats import gaussian_kde, boxcox, kurtosis
 from scipy.signal import find_peaks
 from roma.utils import get_tuple_transform_ops
 import matplotlib
@@ -38,6 +37,31 @@ class ActiveLearningStrategy:
             f"pool={self.train_pool_idx.size}, preseed={self.preseed_idx.size}, "
             f"current={self.train_current_idx.size}"
         )
+
+    def _save_hs_cert_plot(self, mu: float, sigma: float, tau: float, stem: str) -> None:
+        out_dir = osp.dirname(__file__)
+        fname = f"{stem}_hs_cert.png"
+        out_path = osp.join(out_dir, fname)
+        plt.figure(figsize=(5, 3))
+        plt.axis("off")
+        text = [
+            f"{self.job_name} cycle {self.cycle}",
+            f"mu   = {mu:.4f}",
+            f"sigma = {sigma:.4f}",
+            f"tau  = {tau:.4f}",
+        ]
+        plt.text(
+            0.02,
+            0.85,
+            "\n".join(text),
+            fontsize=12,
+            verticalalignment="top",
+            family="monospace",
+        )
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+        log_strategy_action(f"Saved hs_cert plot to {out_path}.")
 
     def _idx_path(self, name: str) -> str:
         fname = name if name.endswith(".npy") else f"{name}.npy"
@@ -255,18 +279,20 @@ class ActiveLearningStrategy:
         hs_cert = 1.0 / (1.0 + np.maximum(hs_vals, 0.0))
         s_min, s_max = float(hs_cert.min()), float(hs_cert.max())
         hs_cert_norm = (hs_cert - s_min) / (s_max - s_min + 1e-8)
-        eps = 1e-8
-        z = hs_cert_norm + eps
-        bc, _ = boxcox(z)
-        g_bc = float(kurtosis(bc, fisher=True, bias=False))
-        B = 1.0 - np.exp(-max(0.0, -g_bc))
         mu = float(hs_cert_norm.mean())
-        tau = mu + B
+        sigma = float(hs_cert_norm.std())
+        tau = mu + sigma
         out_dir = osp.join(self.data_root, "weighted_tau_dpp_plots")
         os.makedirs(out_dir, exist_ok=True)
-        fig, ax = plt.subplots()
-        ax.hist(hs_cert_norm, bins=32, density=True)
-        ax.set_title(f"cycle {self.cycle} tau={tau:.4f}")
+        fig, ax = plt.subplots(figsize=(5, 3))
+        ax.axis("off")
+        summary = [
+            f"{self.job_name} cycle {self.cycle}",
+            f"mu    = {mu:.4f}",
+            f"sigma = {sigma:.4f}",
+            f"tau   = {tau:.4f}",
+        ]
+        ax.text(0.02, 0.85, "\n".join(summary), va="top", ha="left", fontsize=12, family="monospace")
         fig.tight_layout()
         out_path = osp.join(out_dir, f"cycle{self.cycle}_tau_{tau:.4f}.png")
         fig.savefig(out_path)
@@ -470,46 +496,13 @@ class ActiveLearningStrategy:
             hs_vals.append(s)
         hs_vals = np.asarray(hs_vals, dtype=float)
         hs_cert = 1.0 / (1.0 + np.maximum(hs_vals, 0.0))
-        finite_mask = np.isfinite(hs_cert)
-        X = hs_cert[finite_mask].reshape(-1, 1)
-        gmm = GaussianMixture(n_components=2, covariance_type="full", random_state=0)
-        gmm.fit(X)
-        means = gmm.means_.flatten()
-        weights = gmm.weights_.flatten()
-        covs = gmm.covariances_.reshape(-1)
-        order = np.argsort(means)
-        mu_low = float(np.clip(means[order[0]], 0.0, 1.0))
-        mu_high = float(np.clip(means[order[1]], 0.0, 1.0))
-        w_low = float(np.clip(weights[order[0]], 0.0, 1.0))
-        w_high = float(np.clip(weights[order[1]], 0.0, 1.0))
-        var_low = float(covs[order[0]])
-        var_high = float(covs[order[1]])
-        B = (1.0 - mu_low) * mu_high * (1.0 - abs(w_low - w_high))
         mu = float(hs_cert.mean())
-        tau = mu + B
-        out_dir = "/home/abhiram001/active_learning/abhiram/AMD_ab/RoMa-main/roma/strategies/Tau_plots"
-        os.makedirs(out_dir, exist_ok=True)
-        x = np.linspace(0.0, 1.0, 512, dtype=np.float64)
-        pdf = np.zeros_like(x)
-        for m, v, w in zip([mu_low, mu_high], [var_low, var_high], [w_low, w_high]):
-            pdf += w * (1.0 / np.sqrt(2.0 * np.pi * v)) * np.exp(-0.5 * ((x - m) ** 2) / v)
-        fig, ax = plt.subplots()
-        ax.hist(hs_cert, bins=32, range=(0.0, 1.0), density=True, alpha=0.5)
-        ax.plot(x, pdf, linewidth=2.0)
-        ax.set_xlim(0.0, 1.0)
-        ax.set_xlabel("hs_cert")
-        ax.set_ylabel("density")
-        text = f"mu_low={mu_low:.3f}, mu_high={mu_high:.3f}\nB={B:.4f}, tau={tau:.4f}"
-        ax.text(0.05, 0.95, text, transform=ax.transAxes, va="top", ha="left")
-        job_name = getattr(self, "job_name", "run")
-        cycle = getattr(self, "cycle", -1)
-        fname = f"{job_name}_cycle{int(cycle)}_tau_plot.png"
-        out_path = os.path.join(out_dir, fname)
-        fig.tight_layout()
-        fig.savefig(out_path)
-        plt.close(fig)
+        sigma = float(hs_cert.std())
+        tau = mu + sigma
+        stem = f"{self.job_name}_cycle{self.cycle}_kcenter"
+        self._save_hs_cert_plot(mu, sigma, tau, stem)
         u_norm = 1.0 - hs_cert
-        scale = (u_norm ** tau).astype(np.float32)
+        scale = ((1 + u_norm) ** tau).astype(np.float32)
         scale_t = torch.from_numpy(scale).view(-1, 1)
         scaled_embs = cand_embs * scale_t
         picked_local = self._kcenter_from_vecs(scaled_embs, k=k, seed_X=seed_embs)
@@ -570,13 +563,11 @@ class ActiveLearningStrategy:
         hs_cert = 1.0 / (1.0 + np.maximum(hs_vals, 0.0))
         s_min, s_max = float(hs_cert.min()), float(hs_cert.max())
         hs_cert_norm = (hs_cert - s_min) / (s_max - s_min + 1e-8)
-        eps = 1e-8
-        z = hs_cert_norm + eps
-        bc, _ = boxcox(z)
-        g_bc = float(kurtosis(bc, fisher=True, bias=False))
-        B = 1.0 - np.exp(-max(0.0, -g_bc))
         mu = float(hs_cert_norm.mean())
-        tau = mu + B
+        sigma = float(hs_cert_norm.std())
+        tau = mu + sigma
+        stem = f"{self.job_name}_cycle{self.cycle}"
+        self._save_hs_cert_plot(mu, sigma, tau, stem)
         scale = (hs_cert_norm ** tau).astype(np.float32)
         scale_t = torch.from_numpy(scale).view(-1, 1)
         scaled_embs = cand_embs * scale_t
@@ -613,7 +604,7 @@ class ActiveLearningStrategy:
             elif self.strategy == "roma_homography_stability" and model_for_uncertainty is not None:
                 new_idx = self.roma_homography_stability(model_for_uncertainty, k=k)
             elif self.strategy in ("kcenter_uncertainty_weighted", "k_center_greedy_uncertainty") and model_for_uncertainty is not None:
-                new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k, lambda_u=1.0)
+                new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k)
             elif self.strategy == "adaptive_homog_uwe" and model_for_uncertainty is not None:
                 new_idx = self.kcenter_uncertainty_weighted(model_for_uncertainty, k=k)
             elif self.strategy == "dpp" and model_for_uncertainty is not None:

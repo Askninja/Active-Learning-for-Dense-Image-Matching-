@@ -111,6 +111,13 @@ def train_active_learning(args):
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     checkpoint_root = os.path.join("/projects/_hdd/roma", args.dataset_name, args.job_name)
+    selector_seed_job = getattr(args, "selector_seed_job", None) or f"{args.dataset_name}_Preseed"
+    default_seed_path = osp.join(
+        "/projects/_hdd/roma",
+        args.dataset_name,
+        selector_seed_job,
+        f"{selector_seed_job}_cycle0_best.pth",
+    )
     log_action(f"Initialized distributed context (world_size={world_size}, rank={rank}, device={device_id}).")
     os.makedirs(checkpoint_root, exist_ok=True)
     h, w = RESOLUTIONS[args.train_resolution]
@@ -162,11 +169,8 @@ def train_active_learning(args):
                     symmetric=False,
                 ).to(device_id)
                 if cycle == 0:
-                    selector_pretrained = osp.join(
-                        "/projects/_hdd/roma",
-                        args.dataset_name,
-                        "pretrained_seed.pth",
-                    )
+                    selector_pretrained = getattr(args, "selector_seed_path", None) or default_seed_path
+                    log_action(f"[cycle {cycle}] Loading selector seed checkpoint from {selector_pretrained}.")
                     sel_weights = load_model_weights(selector_pretrained, device_id)
                 else:
                     prev_best = osp.join(
@@ -174,7 +178,10 @@ def train_active_learning(args):
                         f"{args.job_name}_cycle{cycle-1}_best.pth",
                     )
                     sel_weights = load_model_weights(prev_best, device_id)
-                log_action(f"[cycle {cycle}] Loading selector weights from {('pretrained seed' if cycle == 0 else prev_best)}.")
+                if cycle == 0:
+                    log_action(f"[cycle {cycle}] Selector seed checkpoint loaded successfully.")
+                else:
+                    log_action(f"[cycle {cycle}] Loading selector weights from {prev_best}.")
                 sel_model.load_state_dict(sel_weights, strict=True)
                 sel_model.eval()
                 log_action(f"[cycle {cycle}] Running selector to pick new indices.")
@@ -365,6 +372,8 @@ def build_argument_parser():
     parser.add_argument("--symmetric", default="False")
     parser.add_argument("--cycles", default=4, type=int)
     parser.add_argument("--start_cycle", default=0, type=int, help="Skip cycles before this index.")
+    parser.add_argument("--selector_seed_path", default=None, help="Explicit path to selector checkpoint for cycle 0.")
+    parser.add_argument("--selector_seed_job", default=None, help="Name of the job subfolder used to locate selector seed.")
     parser.add_argument(
         "--strategy",
         default="coreset",
