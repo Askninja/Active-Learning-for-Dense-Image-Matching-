@@ -74,7 +74,7 @@ def setup_wandb_run(args, cycle):
         os.environ.pop(var, None)
     mode = "online" if (not args.dont_log_wandb and is_rank0()) else "disabled"
     wandb.init(
-        project=f"Roma_New{args.dataset_name}",
+        project=f"Final_Dataset_{args.dataset_name}",
         entity=args.wandb_entity,
         name=f"{args.job_name}_cycle{cycle}",
         mode=mode,
@@ -131,7 +131,7 @@ def train_active_learning(args):
     use_dual_cropping_aug = "D" in args.aug
     symmetric = str(args.symmetric) in ("True", "true", "1")
     depth_interpolation_mode = "bilinear"
-    needs_selector = args.strategy in ("coreset", "k_center_greedy_uncertainty")
+    needs_selector = args.strategy not in ("preseed", "full", "random")
     start_cycle = max(0, int(getattr(args, "start_cycle", 0)))
     if start_cycle >= args.cycles:
         raise ValueError(f"--start_cycle ({start_cycle}) must be less than --cycles ({args.cycles})")
@@ -285,10 +285,12 @@ def train_active_learning(args):
             with torch.no_grad():
                 res_tr = benchmark_train.benchmark(ddp_model.module)
                 res_ev = benchmark_eval.benchmark(ddp_model.module)
+                res_te = benchmark_test.benchmark(ddp_model.module)
             if is_rank0():
                 log_action(f"[cycle {cycle}] Logging metrics at global step {roma.GLOBAL_STEP}.")
                 auc10_tr = float(res_tr.get("auc_10"))
                 auc10_ev = float(res_ev.get("auc_10"))
+                auc3_ev = float(res_ev.get("auc_3"))
                 log_to_wandb(
                     {
                         "auc_10_train": auc10_tr,
@@ -299,10 +301,14 @@ def train_active_learning(args):
                         "auc_3_val": res_ev.get("auc_3"),
                         "epe_train": res_tr.get("epe"),
                         "epe_val": res_ev.get("epe"),
+                        "auc_10_test_current": res_te.get("auc_10"),
+                        "auc_5_test_current": res_te.get("auc_5"),
+                        "auc_3_test_current": res_te.get("auc_3"),
+                        "epe_test_current": res_te.get("epe"),
                         "global_step": int(roma.GLOBAL_STEP),
                     }
                 )
-                acc = auc10_ev
+                acc = auc3_ev
                 acc_best = update_checkpoints(
                     checkpointer,
                     ddp_model.module,
@@ -382,6 +388,10 @@ def build_argument_parser():
             "full",
             "random",
             "coreset",
+            "coreset2",
+            "uncertainty",
+            "kcenter_uncertainty_embedding",
+            "kcenter_uncertainty_weighted_raw",
             "k_center_greedy_uncertainty",
         ],
     )

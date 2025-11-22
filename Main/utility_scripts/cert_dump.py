@@ -403,9 +403,9 @@ def compute_tau_and_plot(stability_values, cycle_label: str, plot_dir: Path):
         D = float(abs(peak_x[1] - peak_x[0]))
         R_sim = float(1.0 - abs(peak_y[1] - peak_y[0]) / (peak_y[1] + peak_y[0] + 1e-12))
 
-    S = D * R_sim
-    m = float(s_norm.mean())
-    tau = 2.0 * S * m
+    mu = float(s_norm.mean())
+    sigma = float(s_norm.std())
+    tau = mu + sigma
 
     out_dir = Path(plot_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
