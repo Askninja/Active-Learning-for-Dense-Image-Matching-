@@ -1,0 +1,433 @@
+import os
+import os.path as osp
+import numpy as np
+from argparse import ArgumentParser
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data.distributed import DistributedSampler
+import wandb
+from tqdm import tqdm
+import roma
+from experiments.train_roma_outdoor import get_model
+from roma.datasets import OpticalMap
+from roma.benchmarks import OpticalmapHomogBenchmark
+from roma.losses.robust_loss import RobustLossesAMD, RobustLossesSymmetric
+from roma.train.train import train_k_steps
+from roma.checkpointing import CheckPoint
+from roma.strategies.strategies import ActiveLearningStrategy
+
+RESOLUTIONS = {
+    "low": (448, 448),
+    "medium": (14 * 8 * 5, 14 * 8 * 5),
+    "high": (14 * 8 * 6, 14 * 8 * 6),
+}
+
+DATASET_DIRS = {
+    "opticalmap": "cross_modality/Optical-Map_12feb",
+    "Optical-Map": "cross_modality/Optical-Map",
+    "Optical-Infrared": "cross_modality/Optical-Infrared",
+    "Optical-Depth": "cross_modality/Optical-Depth",
+    "Optical-Optical": "cross_modality/Optical-Optical",
+    "Nighttime": "cross_modality/Nighttime",
+}
+
+def is_rank0():
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def log_action(message: str):
+    if is_rank0():
+        print(f"[ACTION] {message}", flush=True)
+
+
+def get_dataset_root(base_root, dataset_name):
+    if dataset_name not in DATASET_DIRS:
+        raise ValueError(dataset_name)
+    return osp.join(base_root, DATASET_DIRS[dataset_name])
+
+
+def load_model_weights(path, device_id):
+    if not osp.isfile(path):
+        raise FileNotFoundError(path)
+    ckpt = torch.load(path, map_location=f"cuda:{device_id}")
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        return ckpt["model"]
+    if isinstance(ckpt, dict):
+        return ckpt
+    raise RuntimeError(f"Unexpected checkpoint format at {path}: type {type(ckpt)}")
+
+
+def create_benchmarks(root, train_split, val_split, test_split):
+    return (
+        OpticalmapHomogBenchmark(root, train_split),
+        OpticalmapHomogBenchmark(root, val_split),
+        OpticalmapHomogBenchmark(root, test_split),
+    )
+
+
+def setup_wandb_run(args, cycle):
+    if wandb.run is not None:
+        wandb.finish()
+    for var in ("WANDB_RUN_ID", "WANDB_RESUME", "WANDB_RUN_GROUP"):
+        os.environ.pop(var, None)
+    mode = "online" if (not args.dont_log_wandb and is_rank0()) else "disabled"
+    wandb.init(
+        project=f"Stat_runs",
+        entity=args.wandb_entity,
+        name=f"{args.job_name}_cycle{cycle}",
+        mode=mode,
+        resume="never",
+    )
+    wandb.define_metric("global_step")
+    wandb.define_metric("*", step_metric="global_step")
+
+
+def close_wandb_run():
+    if wandb.run is not None:
+        wandb.finish()
+
+
+def log_to_wandb(payload):
+    if wandb.run is not None:
+        wandb.log(payload)
+
+
+def update_checkpoints(checkpointer, model, optimizer, lr_scheduler, step, acc, acc_best):
+    if acc > acc_best:
+        acc_best = acc
+        checkpointer.save_best(model, optimizer, lr_scheduler, step)
+    checkpointer.save(model, optimizer, lr_scheduler, step)
+    return acc_best
+
+def train_active_learning(args):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    torch.cuda.set_device(local_rank)
+    device_id = local_rank
+    roma.LOCAL_RANK = device_id
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    checkpoint_root = os.path.join("/projects/_hdd/roma", args.dataset_name, args.job_name)
+    selector_seed_job = getattr(args, "selector_seed_job", None) or f"{args.dataset_name}_Preseed"
+    default_seed_path = osp.join(
+        "/projects/_hdd/roma",
+        args.dataset_name,
+        selector_seed_job,
+        f"{selector_seed_job}_cycle0_best.pth",
+    )
+    log_action(f"Initialized distributed context (world_size={world_size}, rank={rank}, device={device_id}).")
+    os.makedirs(checkpoint_root, exist_ok=True)
+    h, w = RESOLUTIONS[args.train_resolution]
+    roma.STEP_SIZE = world_size * args.gpu_batch_size
+    N = int(args.N)
+    k = max(1, 24996 // roma.STEP_SIZE)
+    use_horizontal_flip_aug = "F" in args.aug
+    use_cropping_aug = "C" in args.aug
+    use_color_jitter_aug = "J" in args.aug
+    use_swap_aug = "S" in args.aug
+    use_dual_cropping_aug = "D" in args.aug
+    symmetric = str(args.symmetric) in ("True", "true", "1")
+    depth_interpolation_mode = "bilinear"
+    needs_selector = args.strategy not in ("preseed", "full", "random")
+    start_cycle = max(0, int(getattr(args, "start_cycle", 0)))
+    if start_cycle >= args.cycles:
+        raise ValueError(f"--start_cycle ({start_cycle}) must be less than --cycles ({args.cycles})")
+    log_action(f"Starting active-learning loop from cycle {start_cycle} / {args.cycles}.")
+    for cycle in range(start_cycle, args.cycles):
+        log_action(f"[cycle {cycle}] setup started.")
+        setup_wandb_run(args, cycle)
+        roma.GLOBAL_STEP = 0
+        data_root = get_dataset_root(args.data_root, args.dataset_name)
+        idx_root = osp.join(data_root, "Idx_files")
+        train_split = f"train_{args.split}"
+        val_split = f"val_{args.split}"
+        test_split = f"test_{args.split}"
+        log_action(f"[cycle {cycle}] Preparing selector for dataset at {data_root}.")
+        selector = ActiveLearningStrategy(
+            args,
+            cycle,
+            data_root=data_root,
+            split=train_split,
+            idx_root=idx_root,
+        )
+        stem = f"{args.job_name}_cycle{cycle}"
+        selected_npy = osp.join(idx_root, f"{stem}.npy")
+        train_split_path = f"Idx_files/{selector.split}"
+        val_split_path = f"Idx_files/{val_split}"
+        test_split_path = f"Idx_files/{test_split}"
+        if is_rank0():
+            sel_model = None
+            if needs_selector:
+                log_action(f"[cycle {cycle}] Loading selector model for strategy {args.strategy}.")
+                sel_model = get_model(
+                    pretrained_backbone=True,
+                    resolution=args.train_resolution,
+                    attenuate_cert=False,
+                    symmetric=False,
+                ).to(device_id)
+                if cycle == 0:
+                    selector_pretrained = getattr(args, "selector_seed_path", None) or default_seed_path
+                    log_action(f"[cycle {cycle}] Loading selector seed checkpoint from {selector_pretrained}.")
+                    sel_weights = load_model_weights(selector_pretrained, device_id)
+                else:
+                    prev_best = osp.join(
+                        checkpoint_root,
+                        f"{args.job_name}_cycle{cycle-1}_best.pth",
+                    )
+                    sel_weights = load_model_weights(prev_best, device_id)
+                if cycle == 0:
+                    log_action(f"[cycle {cycle}] Selector seed checkpoint loaded successfully.")
+                else:
+                    log_action(f"[cycle {cycle}] Loading selector weights from {prev_best}.")
+                sel_model.load_state_dict(sel_weights, strict=True)
+                sel_model.eval()
+                log_action(f"[cycle {cycle}] Running selector to pick new indices.")
+                selector.get_train_idx(model_for_uncertainty=sel_model)
+                del sel_model
+                torch.cuda.empty_cache()
+            else:
+                log_action(f"[cycle {cycle}] Running selector without model for strategy {args.strategy}.")
+                selector.get_train_idx()
+            hs_log = getattr(selector, "last_hs_cert_log", None)
+            if hs_log:
+                hs_log = dict(hs_log)
+                hs_log["cycle"] = cycle
+                log_action(f"[cycle {cycle}] hs_cert_scores wall-clock: {hs_log.get('hs_cert_seconds', 'n/a')}s.")
+                log_to_wandb(hs_log)
+        if dist.is_initialized():
+            dist.barrier()
+        train_idx = np.load(selected_npy).astype(int)
+        log_action(f"[cycle {cycle}] Loaded {train_idx.size} training indices from {selected_npy}.")
+        target_train = OpticalMap(
+            data_root=data_root,
+            ht=h,
+            wt=w,
+            use_horizontal_flip_aug=use_horizontal_flip_aug,
+            use_cropping_aug=use_cropping_aug,
+            min_crop_ratio=args.min_crop_ratio,
+            use_color_jitter_aug=use_color_jitter_aug,
+            use_swap_aug=use_swap_aug,
+            use_dual_cropping_aug=use_dual_cropping_aug,
+            split=train_split_path,
+        )
+        target_train.train_idx = train_idx
+        log_action(f"[cycle {cycle}] Building benchmarks for splits ({train_split_path}, {val_split_path}, {test_split_path}).")
+        benchmark_train, benchmark_eval, benchmark_test = create_benchmarks(
+            data_root, train_split_path, val_split_path, test_split_path
+        )
+        model = get_model(
+            pretrained_backbone=True,
+            resolution=args.train_resolution,
+            attenuate_cert=False,
+            symmetric=symmetric,
+        ).to(device_id)
+        if not args.pretrained_path:
+            raise ValueError("pretrained_path is required")
+        weights = load_model_weights(args.pretrained_path, device_id)
+        log_action(f"[cycle {cycle}] Loading model weights from {args.pretrained_path}.")
+        model.load_state_dict(weights, strict=True)
+        loss_class_target = RobustLossesSymmetric if symmetric else RobustLossesAMD
+        log_action(f"[cycle {cycle}] Configuring target loss ({loss_class_target.__name__}).")
+        depth_loss_target = loss_class_target(
+            ce_weight=args.ce_weight,
+            local_dist={1: 4, 2: 4, 4: 8, 8: 8},
+            local_largest_scale=8,
+            depth_interpolation_mode=depth_interpolation_mode,
+            alpha=0.5,
+            c=1e-4,
+        )
+        parameters = [
+            {"params": model.encoder.parameters(), "lr": roma.STEP_SIZE * 5e-6 / 8},
+            {"params": model.decoder.parameters(), "lr": roma.STEP_SIZE * args.dec_lr / 8},
+        ]
+        log_action(f"[cycle {cycle}] Creating optimizer and LR scheduler.")
+        optimizer = torch.optim.AdamW(parameters, weight_decay=0.01)
+        milestones = [int((9 * N / roma.STEP_SIZE) // 10)]
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones)
+        ddp_model = DDP(
+            model,
+            device_ids=[device_id],
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+        )
+        log_action(f"[cycle {cycle}] Wrapped model with DDP on device {device_id}.")
+        grad_scaler = torch.cuda.amp.GradScaler(growth_interval=1_000_000)
+        grad_clip_norm = 0.01
+        stem_ckpt = f"{args.job_name}_cycle{cycle}"
+        checkpointer = CheckPoint(checkpoint_root, stem_ckpt)
+        acc_best = float("-inf")
+        log_action(f"[cycle {cycle}] Starting training chunks up to {N} global steps (chunk size {k}).")
+        for n in range(roma.GLOBAL_STEP, N, k * roma.STEP_SIZE):
+            sampler = RandomSampler(
+                target_train,
+                num_samples=args.gpu_batch_size * k,
+                replacement=False,
+            )
+            dataloader_target = iter(
+                DataLoader(
+                    target_train,
+                    batch_size=args.gpu_batch_size,
+                    sampler=sampler,
+                    num_workers=world_size,
+                    pin_memory=True,
+                )
+            )
+            log_action(f"[cycle {cycle}] Training chunk starting at global step {n}.")
+            train_k_steps(
+                n,
+                k,
+                dataloader_target,
+                ddp_model,
+                depth_loss_target,
+                optimizer,
+                lr_scheduler,
+                grad_scaler,
+                grad_clip_norm=grad_clip_norm,
+            )
+            ddp_model.eval()
+            with torch.no_grad():
+                res_tr = benchmark_train.benchmark(ddp_model.module)
+                res_ev = benchmark_eval.benchmark(ddp_model.module)
+                res_te = benchmark_test.benchmark(ddp_model.module)
+            if is_rank0():
+                log_action(f"[cycle {cycle}] Logging metrics at global step {roma.GLOBAL_STEP}.")
+                auc10_tr = float(res_tr.get("auc_10"))
+                auc10_ev = float(res_ev.get("auc_10"))
+                auc3_ev = float(res_ev.get("auc_3"))
+                log_to_wandb(
+                    {
+                        "auc_10_train": auc10_tr,
+                        "auc_10_val": auc10_ev,
+                        "auc_5_train": res_tr.get("auc_5"),
+                        "auc_5_val": res_ev.get("auc_5"),
+                        "auc_3_train": res_tr.get("auc_3"),
+                        "auc_3_val": res_ev.get("auc_3"),
+                        "epe_train": res_tr.get("epe"),
+                        "epe_val": res_ev.get("epe"),
+                        "auc_10_test_current": res_te.get("auc_10"),
+                        "auc_5_test_current": res_te.get("auc_5"),
+                        "auc_3_test_current": res_te.get("auc_3"),
+                        "epe_test_current": res_te.get("epe"),
+                        "hs_cert_mean_train": res_tr.get("hs_cert_mean"),
+                        "hs_cert_mean_val": res_ev.get("hs_cert_mean"),
+                        "hs_cert_mean_test_current": res_te.get("hs_cert_mean"),
+                        "hs_cert_epe_pearson_train": res_tr.get("hs_cert_epe_pearson"),
+                        "hs_cert_epe_pearson_val": res_ev.get("hs_cert_epe_pearson"),
+                        "hs_cert_epe_pearson_test_current": res_te.get("hs_cert_epe_pearson"),
+                        "global_step": int(roma.GLOBAL_STEP),
+                    }
+                )
+                acc = auc3_ev
+                acc_best = update_checkpoints(
+                    checkpointer,
+                    ddp_model.module,
+                    optimizer,
+                    lr_scheduler,
+                    roma.GLOBAL_STEP,
+                    acc,
+                    acc_best,
+                )
+                log_action(f"[cycle {cycle}] Checkpoints updated (best AUC10={acc_best:.4f}).")
+            ddp_model.train()
+            if dist.is_initialized():
+                dist.barrier()
+        if is_rank0():
+            best_ckpt_path = f"/projects/_hdd/roma/{args.dataset_name}/{args.job_name}/{args.job_name}_cycle{cycle}_best.pth"
+            if not osp.isfile(best_ckpt_path):
+                raise FileNotFoundError(best_ckpt_path)
+            best_states = torch.load(best_ckpt_path, map_location=f"cuda:{device_id}")
+            if not (isinstance(best_states, dict) and "model" in best_states):
+                raise RuntimeError(f"Checkpoint {best_ckpt_path} must be a dict with key 'model'.")
+            ddp_model.module.load_state_dict(best_states["model"], strict=True)
+            ddp_model.eval()
+            with torch.no_grad():
+                res_test = benchmark_test.benchmark(ddp_model.module)
+            log_action(f"[cycle {cycle}] Evaluated on test set with restored best checkpoint.")
+            log_to_wandb(
+                {
+                    "auc_10_test": res_test.get("auc_10"),
+                    "auc_5_test": res_test.get("auc_5"),
+                    "auc_3_test": res_test.get("auc_3"),
+                    "epe_test": res_test.get("epe"),
+                    "hs_cert_mean_test": res_test.get("hs_cert_mean"),
+                    "hs_cert_epe_pearson_test": res_test.get("hs_cert_epe_pearson"),
+                }
+            )
+        close_wandb_run()
+        del ddp_model, model, optimizer, lr_scheduler, target_train
+        torch.cuda.empty_cache()
+        if dist.is_initialized():
+            dist.barrier()
+        if is_rank0():
+            log_action(f"[cycle {cycle}] completed successfully.")
+            tqdm.write(f"[cycle {cycle}] completed.")
+    if is_rank0():
+        log_action("All active-learning cycles completed.")
+        tqdm.write("All AL cycles completed.")
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def build_argument_parser():
+    parser = ArgumentParser()
+    parser.add_argument("--dont_log_wandb", action="store_true")
+    parser.add_argument("--train_resolution", default="low")
+    parser.add_argument("--gpu_batch_size", default=4, type=int)
+    parser.add_argument("--wandb_entity", required=False)
+    parser.add_argument(
+        "--data_root",
+        default="/home/abhiram001/active_learning/abhiram/AMD_ab/datasets/",
+    )
+    parser.add_argument("--job_name", default="opticalmap_split_0.8_train_coreset")
+    parser.add_argument("--dataset_name", default="opticalmap")
+    parser.add_argument("--pretrained_path", default="workspace/checkpoints/roma_outdoor.pth")
+    parser.add_argument("--N", default=int(8e2), type=int)
+    parser.add_argument("--ce_weight", default=0.01, type=float)
+    parser.add_argument("--aug", default="F")
+    parser.add_argument("--min_crop_ratio", default=0.5, type=float)
+    parser.add_argument("--dec_lr", default=1e-4, type=float)
+    parser.add_argument(
+        "--hs_cert_thresh",
+        default=None,
+        type=float,
+        help="Override symmetric thresholds for kcenter_uncertainty_weighted_raw (x -> min(x,1-x)/max(x,1-x)).",
+    )
+    parser.add_argument("--split", default="idx")
+    parser.add_argument("--symmetric", default="False")
+    parser.add_argument("--cycles", default=4, type=int)
+    parser.add_argument("--start_cycle", default=0, type=int, help="Skip cycles before this index.")
+    parser.add_argument("--selector_seed_path", default=None, help="Explicit path to selector checkpoint for cycle 0.")
+    parser.add_argument("--selector_seed_job", default=None, help="Name of the job subfolder used to locate selector seed.")
+    parser.add_argument(
+        "--strategy",
+        default="coreset",
+        choices=[
+            "preseed",
+            "full",
+            "random",
+            "coreset",
+            "coreset2",
+            "entropy",
+            "uncertainty",
+            "kcenter_uncertainty_embedding",
+            "kcenter_uncertainty_weighted_raw",
+            "kcenter_entropy_weighted_raw",
+            "k_center_greedy_uncertainty",
+            "kmeans_diversity",
+            "clue",
+            "badge",
+        ],
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"
+    os.environ.setdefault("OMP_NUM_THREADS", "16")
+    torch.backends.cudnn.allow_tf32 = True
+    parser = build_argument_parser()
+    args, _ = parser.parse_known_args()
+    roma.DEBUG_MODE = False
+    train_active_learning(args)
