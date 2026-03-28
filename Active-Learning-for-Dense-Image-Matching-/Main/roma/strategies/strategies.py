@@ -337,7 +337,7 @@ class ActiveLearningStrategy:
             a_path, b_path = self._idx_to_paths(int(i))
             dense_matches, dense_certainty = model_for_uncertainty.match(a_path, b_path)
             sparse_matches, _ = model_for_uncertainty.sample(
-                dense_matches, dense_certainty, 5000, thresh_score=0.05
+                dense_matches, dense_certainty, 5000, thresh_score=0.05, sample_seed=int(i)
             )
             sm = sparse_matches.detach().cpu().numpy()
             if sm.shape[0] < 8:
@@ -585,7 +585,13 @@ class ActiveLearningStrategy:
         for idx in avail:
             a_path, b_path = self._idx_to_paths(int(idx))
             dense_matches, dense_certainty = model_for_uncertainty.match(a_path, b_path)
-            sparse_matches, _ = model_for_uncertainty.sample(dense_matches, dense_certainty, 5000, thresh_score=0.05)
+            sparse_matches, _ = model_for_uncertainty.sample(
+                dense_matches,
+                dense_certainty,
+                5000,
+                thresh_score=0.05,
+                sample_seed=int(idx),
+            )
             sm = sparse_matches.detach().cpu().numpy()
             if sm.shape[0] < 8:
                 scores.append((int(idx), 0.0))

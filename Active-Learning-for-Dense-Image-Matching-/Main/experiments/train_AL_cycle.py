@@ -17,6 +17,7 @@ from roma.losses.robust_loss import RobustLossesAMD, RobustLossesSymmetric
 from roma.train.train import train_k_steps
 from roma.checkpointing import CheckPoint
 from roma.strategies.strategies import ActiveLearningStrategy
+from roma.utils import configure_determinism, seed_worker_builder
 
 RESOLUTIONS = {
     "low": (448, 448),
@@ -102,6 +103,7 @@ def update_checkpoints(checkpointer, model, optimizer, lr_scheduler, step, acc, 
     return acc_best
 
 def train_active_learning(args):
+    configure_determinism(args.seed, deterministic=True)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
@@ -118,7 +120,9 @@ def train_active_learning(args):
         selector_seed_job,
         f"{selector_seed_job}_cycle0_best.pth",
     )
-    log_action(f"Initialized distributed context (world_size={world_size}, rank={rank}, device={device_id}).")
+    log_action(
+        f"Initialized distributed context (world_size={world_size}, rank={rank}, device={device_id}, seed={args.seed})."
+    )
     os.makedirs(checkpoint_root, exist_ok=True)
     h, w = RESOLUTIONS[args.train_resolution]
     roma.STEP_SIZE = world_size * args.gpu_batch_size
@@ -212,6 +216,7 @@ def train_active_learning(args):
             use_swap_aug=use_swap_aug,
             use_dual_cropping_aug=use_dual_cropping_aug,
             split=train_split_path,
+            base_seed=args.seed + cycle * 1_000_000,
         )
         target_train.train_idx = train_idx
         log_action(f"[cycle {cycle}] Building benchmarks for splits ({train_split_path}, {val_split_path}, {test_split_path}).")
@@ -261,10 +266,14 @@ def train_active_learning(args):
         acc_best = float("-inf")
         log_action(f"[cycle {cycle}] Starting training chunks up to {N} global steps (chunk size {k}).")
         for n in range(roma.GLOBAL_STEP, N, k * roma.STEP_SIZE):
+            chunk_seed = args.seed + cycle * 1_000_000 + n + rank * 10_000_000
+            sampler_generator = torch.Generator()
+            sampler_generator.manual_seed(chunk_seed)
             sampler = RandomSampler(
                 target_train,
                 num_samples=args.gpu_batch_size * k,
                 replacement=False,
+                generator=sampler_generator,
             )
             dataloader_target = iter(
                 DataLoader(
@@ -273,6 +282,8 @@ def train_active_learning(args):
                     sampler=sampler,
                     num_workers=world_size,
                     pin_memory=True,
+                    worker_init_fn=seed_worker_builder(chunk_seed),
+                    generator=sampler_generator,
                 )
             )
             log_action(f"[cycle {cycle}] Training chunk starting at global step {n}.")
@@ -400,6 +411,7 @@ def build_argument_parser():
     parser.add_argument("--start_cycle", default=0, type=int, help="Skip cycles before this index.")
     parser.add_argument("--selector_seed_path", default=None, help="Explicit path to selector checkpoint for cycle 0.")
     parser.add_argument("--selector_seed_job", default=None, help="Name of the job subfolder used to locate selector seed.")
+    parser.add_argument("--seed", default=1337, type=int, help="Global seed used for deterministic training and sampling.")
     parser.add_argument(
         "--strategy",
         default="coreset",
@@ -425,8 +437,10 @@ def build_argument_parser():
 
 if __name__ == "__main__":
     os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     os.environ.setdefault("OMP_NUM_THREADS", "16")
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     parser = build_argument_parser()
     args, _ = parser.parse_known_args()
     roma.DEBUG_MODE = False

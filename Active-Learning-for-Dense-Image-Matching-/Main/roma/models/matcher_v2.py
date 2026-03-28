@@ -615,7 +615,17 @@ class RegressionMatcher(nn.Module):
         matches,
         certainty,
         num=10000,
+        sample_seed=None,
     ):
+        def _multinomial_without_replacement(probs, num_samples):
+            if sample_seed is None:
+                return torch.multinomial(probs, num_samples=num_samples, replacement=False)
+            probs_cpu = probs.detach().float().cpu()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(sample_seed))
+            samples = torch.multinomial(probs_cpu, num_samples=num_samples, replacement=False, generator=generator)
+            return samples.to(device=probs.device)
+
         if "threshold" in self.sample_mode:
             upper_thresh = self.sample_thresh
             certainty = certainty.clone()
@@ -625,18 +635,20 @@ class RegressionMatcher(nn.Module):
             certainty.reshape(-1),
         )
         expansion_factor = 4 if "balanced" in self.sample_mode else 1
-        good_samples = torch.multinomial(certainty, 
-                          num_samples = min(expansion_factor*num, len(certainty)), 
-                          replacement=False)
+        good_samples = _multinomial_without_replacement(
+            certainty,
+            num_samples=min(expansion_factor * num, len(certainty)),
+        )
         good_matches, good_certainty = matches[good_samples], certainty[good_samples]
         if "balanced" not in self.sample_mode:
             return good_matches, good_certainty
         density = kde(good_matches, std=0.1)
         p = 1 / (density+1)
         p[density < 10] = 1e-7 # Basically should have at least 10 perfect neighbours, or around 100 ok ones
-        balanced_samples = torch.multinomial(p, 
-                          num_samples = min(num,len(good_certainty)), 
-                          replacement=False)
+        balanced_samples = _multinomial_without_replacement(
+            p,
+            num_samples=min(num, len(good_certainty)),
+        )
         return good_matches[balanced_samples], good_certainty[balanced_samples]
 
     def forward(self, batch, batched = True, upsample = False, scale_factor = 1):

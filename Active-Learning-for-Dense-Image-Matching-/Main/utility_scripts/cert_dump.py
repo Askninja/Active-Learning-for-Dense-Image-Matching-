@@ -318,6 +318,7 @@ def _roma_homography_std(model, a_path: str, b_path: str, settings: HomographySe
         dense_certainty,
         settings.n_sample,
         thresh_score=settings.thresh_score,
+        sample_seed=sum(ord(ch) for ch in f"{a_path}|{b_path}"),
     )
     sm = sparse_matches.detach().cpu().numpy()
     if sm.shape[0] < 8:

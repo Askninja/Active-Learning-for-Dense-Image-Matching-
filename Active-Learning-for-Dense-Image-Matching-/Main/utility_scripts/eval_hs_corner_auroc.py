@@ -237,7 +237,13 @@ def evaluate(config: EvalConfig) -> dict[str, float]:
             H_gt = homo.astype(float)
 
             dense_matches, dense_certainty = model.match(optical, depth)
-            sparse_matches, _ = model.sample(dense_matches, dense_certainty, config.n_sample, thresh_score=config.thresh_score)
+            sparse_matches, _ = model.sample(
+                dense_matches,
+                dense_certainty,
+                config.n_sample,
+                thresh_score=config.thresh_score,
+                sample_seed=int(idx),
+            )
             sm = sparse_matches.detach().cpu().numpy()
             if sm.shape[0] < 4:
                 logging.warning("Too few matches for idx=%s (got %d); skipping.", idx, sm.shape[0])

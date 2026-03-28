@@ -61,7 +61,13 @@ class OpticalmapHomogBenchmark:
         with Image.open(im_B_path) as imB_pil:
             w2, h2 = imB_pil.size
         dense_matches, dense_certainty = model.match(im_A_path, im_B_path)
-        sparse_matches, _ = model.sample(dense_matches, dense_certainty, n_sample, thresh_score=thresh_score)
+        sparse_matches, _ = model.sample(
+            dense_matches,
+            dense_certainty,
+            n_sample,
+            thresh_score=thresh_score,
+            sample_seed=1234,
+        )
         sm = sparse_matches.detach().cpu().numpy()
         if sm.shape[0] < 8:
             return 0.0
@@ -123,7 +129,11 @@ class OpticalmapHomogBenchmark:
             w2, h2 = im_B.size
             dense_matches, dense_certainty = model.match(im_A_path, im_B_path)
             sparse_matches, sparse_certainty = model.sample(
-                dense_matches, dense_certainty, 5000, thresh_score=thresh_score
+                dense_matches,
+                dense_certainty,
+                5000,
+                thresh_score=thresh_score,
+                sample_seed=int(idx),
             )
             sparse_matches_np = sparse_matches.cpu().numpy()
             pos_a, pos_b = self.convert_coordinates(
@@ -350,7 +360,11 @@ class OpticalmapHomogBenchmark:
 
     def get_error(self, model, dense_matches, dense_certainty, n_sample, thresh_score, w1, h1, w2, h2, H_gt):
         sparse_matches, sparse_certainty = model.sample(
-            dense_matches, dense_certainty, 5000, thresh_score=thresh_score
+            dense_matches,
+            dense_certainty,
+            5000,
+            thresh_score=thresh_score,
+            sample_seed=1234,
         )
         sparse_matches_np = sparse_matches.cpu().numpy()
         pos_a, pos_b = self.convert_coordinates(
@@ -462,7 +476,11 @@ class OpticalmapHomogBenchmark:
             w2, h2 = im_B.size
             dense_matches, dense_certainty = model.match(im_A_path, im_B_path)
             sparse_matches, sparse_certainty = model.sample(
-                dense_matches, dense_certainty, 5000, thresh_score=thresh_score
+                dense_matches,
+                dense_certainty,
+                5000,
+                thresh_score=thresh_score,
+                sample_seed=int(idx),
             )
             sparse_matches_np = sparse_matches.cpu().numpy()
             pos_a, pos_b = self.convert_coordinates(

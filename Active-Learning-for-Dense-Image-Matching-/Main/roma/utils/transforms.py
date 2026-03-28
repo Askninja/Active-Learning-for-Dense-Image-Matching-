@@ -1,5 +1,4 @@
 from typing import Dict
-import numpy as np
 import torch
 import kornia.augmentation as K
 from kornia.geometry.transform import warp_perspective
@@ -14,7 +13,7 @@ class GeometricSequential:
         b, c, h, w = x.shape
         M = torch.eye(3, device=x.device)[None].expand(b, 3, 3)
         for t in self.transforms:
-            if np.random.rand() < t.p:
+            if torch.rand((), device=x.device).item() < t.p:
                 M = M.matmul(
                     t.compute_transformation(x, t.generate_parameters((b, c, h, w)), None)
                 )

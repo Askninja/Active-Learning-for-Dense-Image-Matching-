@@ -223,6 +223,7 @@ def _run_for_checkpoint(
         certainty,
         num=max(sample_pool, num_matches),
         thresh_score=thresh_score,
+        sample_seed=sum(ord(ch) for ch in f"{image_a}|{image_b}"),
     )
     h, w = warp.shape[:2]
     im_a = Image.open(image_a).convert("RGB").resize((w, h))
