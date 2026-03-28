@@ -11,4 +11,6 @@ Main/slurmfiles/
 **.png
 **.jpg
 **.csv
-datasets/
+**.npy
+../datasets/
+Active-Learning-for-Dense-Image-Matching-/datasets
