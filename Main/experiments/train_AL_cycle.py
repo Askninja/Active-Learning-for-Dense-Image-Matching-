@@ -5,8 +5,7 @@ from argparse import ArgumentParser
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, RandomSampler
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, Subset
 import wandb
 from tqdm import tqdm
 import roma
@@ -17,6 +16,18 @@ from roma.losses.robust_loss import RobustLossesAMD, RobustLossesSymmetric
 from roma.train.train import train_k_steps
 from roma.checkpointing import CheckPoint
 from roma.strategies.strategies import ActiveLearningStrategy
+from experiments.al_utils import (
+    is_rank0,
+    log_action,
+    get_dataset_root,
+    load_model_weights,
+    create_benchmarks,
+    setup_wandb_run,
+    close_wandb_run,
+    log_to_wandb,
+    update_checkpoints,
+)
+
 
 RESOLUTIONS = {
     "low": (448, 448),
@@ -31,75 +42,10 @@ DATASET_DIRS = {
     "Optical-Depth": "cross_modality/Optical-Depth",
     "Optical-Optical": "cross_modality/Optical-Optical",
     "Nighttime": "cross_modality/Nighttime",
+    "Map-Data": "cross_modality/Map-Data"
 }
 
-def is_rank0():
-    return int(os.environ.get("RANK", "0")) == 0
 
-
-def log_action(message: str):
-    if is_rank0():
-        print(f"[ACTION] {message}", flush=True)
-
-
-def get_dataset_root(base_root, dataset_name):
-    if dataset_name not in DATASET_DIRS:
-        raise ValueError(dataset_name)
-    return osp.join(base_root, DATASET_DIRS[dataset_name])
-
-
-def load_model_weights(path, device_id):
-    if not osp.isfile(path):
-        raise FileNotFoundError(path)
-    ckpt = torch.load(path, map_location=f"cuda:{device_id}")
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        return ckpt["model"]
-    if isinstance(ckpt, dict):
-        return ckpt
-    raise RuntimeError(f"Unexpected checkpoint format at {path}: type {type(ckpt)}")
-
-
-def create_benchmarks(root, train_split, val_split, test_split):
-    return (
-        OpticalmapHomogBenchmark(root, train_split),
-        OpticalmapHomogBenchmark(root, val_split),
-        OpticalmapHomogBenchmark(root, test_split),
-    )
-
-
-def setup_wandb_run(args, cycle):
-    if wandb.run is not None:
-        wandb.finish()
-    for var in ("WANDB_RUN_ID", "WANDB_RESUME", "WANDB_RUN_GROUP"):
-        os.environ.pop(var, None)
-    mode = "online" if (not args.dont_log_wandb and is_rank0()) else "disabled"
-    wandb.init(
-        project=f"Final_Dataset_{args.dataset_name}",
-        entity=args.wandb_entity,
-        name=f"{args.job_name}_cycle{cycle}",
-        mode=mode,
-        resume="never",
-    )
-    wandb.define_metric("global_step")
-    wandb.define_metric("*", step_metric="global_step")
-
-
-def close_wandb_run():
-    if wandb.run is not None:
-        wandb.finish()
-
-
-def log_to_wandb(payload):
-    if wandb.run is not None:
-        wandb.log(payload)
-
-
-def update_checkpoints(checkpointer, model, optimizer, lr_scheduler, step, acc, acc_best):
-    if acc > acc_best:
-        acc_best = acc
-        checkpointer.save_best(model, optimizer, lr_scheduler, step)
-    checkpointer.save(model, optimizer, lr_scheduler, step)
-    return acc_best
 
 def train_active_learning(args):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -111,19 +57,29 @@ def train_active_learning(args):
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     checkpoint_root = os.path.join("/projects/_hdd/roma", args.dataset_name, args.job_name)
-    selector_seed_job = getattr(args, "selector_seed_job", None) or f"{args.dataset_name}_Preseed"
-    default_seed_path = osp.join(
-        "/projects/_hdd/roma",
-        args.dataset_name,
-        selector_seed_job,
-        f"{selector_seed_job}_cycle0_best.pth",
-    )
+    selector_seed_job = getattr(args, "selector_seed_job", None)
+    if args.selector_seed_path is not None:
+        default_seed_path = args.selector_seed_path
+    elif selector_seed_job is None:
+        selector_seed = "pretrained_seed"
+        default_seed_path = osp.join(
+            "/home/abhiram001/Active-Learning-for-Dense-Image-Matching-/Main/workspace/checkpoints",
+            args.dataset_name,
+            f"{selector_seed}.pth",
+        )
+    else:
+       default_seed_path = osp.join(
+            checkpoint_root,
+            selector_seed_job,
+            f"{selector_seed_job}_cycle0_best.pth"
+        )
+
     log_action(f"Initialized distributed context (world_size={world_size}, rank={rank}, device={device_id}).")
     os.makedirs(checkpoint_root, exist_ok=True)
     h, w = RESOLUTIONS[args.train_resolution]
     roma.STEP_SIZE = world_size * args.gpu_batch_size
     N = int(args.N)
-    k = max(1, 24996 // roma.STEP_SIZE)
+    k = max(1, int(args.eval_interval) // roma.STEP_SIZE)
     use_horizontal_flip_aug = "F" in args.aug
     use_cropping_aug = "C" in args.aug
     use_color_jitter_aug = "J" in args.aug
@@ -133,9 +89,9 @@ def train_active_learning(args):
     depth_interpolation_mode = "bilinear"
     needs_selector = args.strategy not in ("preseed", "full", "random")
     start_cycle = max(0, int(getattr(args, "start_cycle", 0)))
-    if start_cycle >= args.cycles:
-        raise ValueError(f"--start_cycle ({start_cycle}) must be less than --cycles ({args.cycles})")
-    log_action(f"Starting active-learning loop from cycle {start_cycle} / {args.cycles}.")
+    
+    
+    
     for cycle in range(start_cycle, args.cycles):
         log_action(f"[cycle {cycle}] setup started.")
         setup_wandb_run(args, cycle)
@@ -158,6 +114,7 @@ def train_active_learning(args):
         train_split_path = f"Idx_files/{selector.split}"
         val_split_path = f"Idx_files/{val_split}"
         test_split_path = f"Idx_files/{test_split}"
+        
         if is_rank0():
             sel_model = None
             if needs_selector:
@@ -169,7 +126,7 @@ def train_active_learning(args):
                     symmetric=False,
                 ).to(device_id)
                 if cycle == 0:
-                    selector_pretrained = getattr(args, "selector_seed_path", None) or default_seed_path
+                    selector_pretrained = default_seed_path
                     log_action(f"[cycle {cycle}] Loading selector seed checkpoint from {selector_pretrained}.")
                     sel_weights = load_model_weights(selector_pretrained, device_id)
                 else:
@@ -218,8 +175,12 @@ def train_active_learning(args):
             attenuate_cert=False,
             symmetric=symmetric,
         ).to(device_id)
+        if world_size > 1:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        
         if not args.pretrained_path:
             raise ValueError("pretrained_path is required")
+        
         weights = load_model_weights(args.pretrained_path, device_id)
         log_action(f"[cycle {cycle}] Loading model weights from {args.pretrained_path}.")
         model.load_state_dict(weights, strict=True)
@@ -255,16 +216,27 @@ def train_active_learning(args):
         acc_best = float("-inf")
         log_action(f"[cycle {cycle}] Starting training chunks up to {N} global steps (chunk size {k}).")
         for n in range(roma.GLOBAL_STEP, N, k * roma.STEP_SIZE):
-            sampler = RandomSampler(
-                target_train,
-                num_samples=args.gpu_batch_size * k,
-                replacement=False,
-            )
+            total_chunk_samples = roma.STEP_SIZE * k
+            if len(target_train) < roma.STEP_SIZE:
+                raise ValueError(
+                    f"Dataset has only {len(target_train)} samples, which is fewer than "
+                    f"STEP_SIZE={roma.STEP_SIZE} (world_size × gpu_batch_size). "
+                    f"Reduce --gpu_batch_size or use fewer GPUs."
+                )
+            chunk_seed = cycle * 1_000_000 + n
+            generator = torch.Generator()
+            generator.manual_seed(chunk_seed)
+            # Sample with replacement when dataset is smaller than the chunk budget
+            if len(target_train) >= total_chunk_samples:
+                chunk_indices = torch.randperm(len(target_train), generator=generator)[:total_chunk_samples]
+            else:
+                chunk_indices = torch.randint(0, len(target_train), (total_chunk_samples,), generator=generator)
+            local_chunk_indices = chunk_indices.view(world_size, args.gpu_batch_size * k)[rank].tolist()
+            local_train_subset = Subset(target_train, local_chunk_indices)
             dataloader_target = iter(
                 DataLoader(
-                    target_train,
+                    local_train_subset,
                     batch_size=args.gpu_batch_size,
-                    sampler=sampler,
                     num_workers=world_size,
                     pin_memory=True,
                 )
@@ -290,7 +262,7 @@ def train_active_learning(args):
                 log_action(f"[cycle {cycle}] Logging metrics at global step {roma.GLOBAL_STEP}.")
                 auc10_tr = float(res_tr.get("auc_10"))
                 auc10_ev = float(res_ev.get("auc_10"))
-                auc3_ev = float(res_ev.get("auc_3"))
+                auc5_ev = float(res_ev.get("auc_5"))
                 log_to_wandb(
                     {
                         "auc_10_train": auc10_tr,
@@ -308,7 +280,7 @@ def train_active_learning(args):
                         "global_step": int(roma.GLOBAL_STEP),
                     }
                 )
-                acc = auc3_ev
+                acc = auc5_ev
                 acc_best = update_checkpoints(
                     checkpointer,
                     ddp_model.module,
@@ -318,7 +290,7 @@ def train_active_learning(args):
                     acc,
                     acc_best,
                 )
-                log_action(f"[cycle {cycle}] Checkpoints updated (best AUC10={acc_best:.4f}).")
+                log_action(f"[cycle {cycle}] Checkpoints updated (best AUC5={acc_best:.4f}).")
             ddp_model.train()
             if dist.is_initialized():
                 dist.barrier()
@@ -370,6 +342,7 @@ def build_argument_parser():
     parser.add_argument("--dataset_name", default="opticalmap")
     parser.add_argument("--pretrained_path", default="workspace/checkpoints/roma_outdoor.pth")
     parser.add_argument("--N", default=int(8e2), type=int)
+    parser.add_argument("--eval_interval", default=5000, type=int, help="Global steps between each benchmark evaluation.")
     parser.add_argument("--ce_weight", default=0.01, type=float)
     parser.add_argument("--aug", default="F")
     parser.add_argument("--min_crop_ratio", default=0.5, type=float)
@@ -388,13 +361,27 @@ def build_argument_parser():
             "full",
             "random",
             "coreset",
+            "geometry_diversity",
+            "entropy_weighted_coreset",
+            "hs_cert_weighted_coreset",
             "coreset2",
             "uncertainty",
             "kcenter_uncertainty_embedding",
             "kcenter_uncertainty_weighted_raw",
             "k_center_greedy_uncertainty",
+            "entropy",
+            "hs_cert",
+            "coreset_appearance",
+            "eigenvalue_diversity",
+            "displacement_diversity",
+            "combined_eigen_displacement",
+            "hs_cert_weighted_eigenvalue_diversity",
         ],
     )
+    parser.add_argument("--selector_batch_size", default=8, type=int)
+    parser.add_argument("--geometry_hist_bins", default=16, type=int)
+    parser.add_argument("--geometry_conf_threshold", default=0.5, type=float)
+    parser.add_argument("--geometry_chunk_size", default=2048, type=int)
     return parser
 
 

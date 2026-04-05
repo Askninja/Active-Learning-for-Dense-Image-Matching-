@@ -1,13 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# SLURM job outputs
+*.out
+*.err
+
+# Logs
+*.log
+Main/logs/
+Main/full/
+
+# Dataset index files (runtime-generated .npy artifacts)
+datasets/
+*.npy
+
+
+# Model checkpoints and workspace
+*.pth
+Main/workspace/
+
+# Training output directories
+Main/entropy_histograms/
+Main/hs_cert_histograms/
+
+# Slurm scripts (not source code)
+Main/slurmfiles/
+
+# Weights & Biases
 wandb/
 *.wandb
-Main/logs/
-*.log
-Main/workspace/
-Main/slurmfiles/
-**/__pycache__/
-*.err
-*.out
-**.pyc
-**.png
-**.jpg
-**.csv
+
+# Images and plots
+*.png
+*.jpg
+*.jpeg
+
+# Misc
+*.csv
