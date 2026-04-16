@@ -1,10 +1,10 @@
 import numpy as np
 from pathlib import Path
 
-SEED = 110105
-COUNTS = (150, 20, 20, 10)
+SEED = 11012005
+COUNTS = (130, 30, 30, 10)
 NUM_SAMPLES = sum(COUNTS)
-DATA_ROOT = Path(__file__).resolve().parents[2] / 'datasets' / 'cross_modality' / 'Optical-Optical' / 'Idx_files'
+DATA_ROOT = Path(__file__).resolve().parents[2] / 'datasets' / 'cross_modality' / 'Nighttime' / 'Idx_files'
 
 
 def main() -> None:

@@ -1,7 +1,7 @@
 """HS-Cert strategy: select top-k pairs by homography-spread uncertainty."""
 
 import numpy as np
-import torch
+from roma.strategies.uncertainty_estimation import compute_uncertainty_and_homographies
 from roma.strategies.strategy_utils import log_strategy_action
 
 
@@ -11,6 +11,10 @@ def run(strategy, k: int, model) -> np.ndarray:
     HS uncertainty measures how much RANSAC homographies vary across random subsets
     of the predicted matches. High variance means the model produces inconsistent
     correspondences, indicating a hard or ambiguous scene.
+
+    The K=50 RANSAC homographies computed here are cached in
+    ``strategy.homography_sets`` so that a subsequent geometry_diversity step
+    (in a combined strategy) can reuse them without a second forward pass.
 
     Args:
         strategy: ActiveLearningStrategy instance.
@@ -27,29 +31,17 @@ def run(strategy, k: int, model) -> np.ndarray:
         return np.empty(0, dtype=int)
     k = min(int(k), avail.size)
 
-    from torch.utils.data import DataLoader
-    dataset = strategy._entropy_dataset(avail)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
-    device = next(model.parameters()).device
-    model.eval()
-    scores = []
-    selected_scale = None
-    with torch.no_grad():
-        for sample_idx, batch in zip(avail.astype(int), dataloader):
-            batch = {k_: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k_, v in batch.items()}
-            corresps = model(batch)
-            if selected_scale is None:
-                selected_scale = max(corresps.keys())
-                log_strategy_action(f"HS-Cert: using finest scale={selected_scale}.")
-            flow = corresps[selected_scale]["flow"]
-            certainty = corresps[selected_scale]["certainty"]
-            H, W = flow.shape[-2:]
-            M = strategy._get_matches(flow, certainty, H, W, num_matches=5000)
-            scores.append((sample_idx, float(strategy._compute_hs_uncertainty(M, H, W, K=10, P=50))))
-
-    if not scores:
+    uncertainties, _certainties, _homographies, valid_ids = (
+        compute_uncertainty_and_homographies(strategy, model, avail)
+    )
+    if valid_ids.size == 0:
         return np.empty(0, dtype=int)
-    order = np.argsort([s for _, s in scores])[::-1]
-    chosen = [scores[pos][0] for pos in order[:k]]
-    log_strategy_action(f"HS-Cert: scored {len(scores)} samples.")
-    return np.asarray(chosen, dtype=int)
+
+    # Sort by descending uncertainty and return the top-k pool indices
+    order = np.argsort(uncertainties)[::-1]
+    chosen = valid_ids[order[:k]].astype(int)
+    log_strategy_action(
+        f"HS-Cert: scored {valid_ids.size} samples, "
+        f"mean_uncertainty={float(uncertainties.mean()):.4f}, selected {chosen.size}."
+    )
+    return chosen

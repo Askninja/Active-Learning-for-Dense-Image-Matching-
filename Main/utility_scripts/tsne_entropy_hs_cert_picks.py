@@ -62,8 +62,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=15)
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
     parser.add_argument("--tsne-iterations", type=int, default=1000)
-    parser.add_argument("--K", type=int, default=10, help="HS Cert homography subsets.")
-    parser.add_argument("--P", type=int, default=50, help="HS Cert sampled points.")
+    parser.add_argument("--K", type=int, default=50, help="HS Cert homography subsets.")
+    parser.add_argument("--P", type=int, default=4, help="HS Cert sampled points.")
     parser.add_argument("--num-matches", type=int, default=5000, help="HS Cert sampled matches.")
     parser.add_argument(
         "--out-dir",
@@ -163,32 +163,26 @@ def _compute_hs_uncertainty(matches: np.ndarray, height: int, width: int, K: int
         return 1.0
     center = np.array([width / 2.0, height / 2.0, width / 2.0, height / 2.0], dtype=np.float64)
     scale = np.array([width / 2.0, height / 2.0, width / 2.0, height / 2.0], dtype=np.float64)
-    points_a = rng.random((P, 2)) * np.array([width, height], dtype=np.float64)
-    points_a_norm = (points_a - np.array([width / 2.0, height / 2.0], dtype=np.float64)) / np.array(
-        [width / 2.0, height / 2.0], dtype=np.float64
-    )
+    # 4 corners of image A in pixel space (paper Sec. IV.B)
+    corners_a = np.array([[0, 0], [width, 0], [0, height], [width, height]], dtype=np.float64)
 
     projections = []
     for _ in range(K):
         subset_size = min(1000, len(matches))
         subset_idx = rng.choice(len(matches), subset_size, replace=False)
-        subset = matches[subset_idx]
-        subset_px = subset * scale + center
+        subset_px = matches[subset_idx] * scale + center
         kpts_a = subset_px[:, :2]
         kpts_b = subset_px[:, 2:]
         H_mat, _ = cv2.findHomography(kpts_a, kpts_b, cv2.RANSAC, 5.0)
         if H_mat is None:
             H_mat = np.eye(3, dtype=np.float64)
-        points_h = np.hstack((points_a_norm, np.ones((P, 1), dtype=np.float64)))
-        proj_h = points_h @ H_mat.T
+        corners_h = np.hstack((corners_a, np.ones((4, 1), dtype=np.float64)))
+        proj_h = corners_h @ H_mat.T
         denom = np.where(np.abs(proj_h[:, 2:3]) < 1e-12, 1e-12, proj_h[:, 2:3])
         projections.append(proj_h[:, :2] / denom)
 
-    projections = np.asarray(projections, dtype=np.float64)
-    stds = []
-    for i in range(P):
-        pts = projections[:, i, :]
-        stds.append(float(np.sqrt(np.std(pts[:, 0]) ** 2 + np.std(pts[:, 1]) ** 2)))
+    projections = np.asarray(projections, dtype=np.float64)  # (K, 4, 2)
+    stds = [0.5 * (float(np.std(projections[:, i, 0])) + float(np.std(projections[:, i, 1]))) for i in range(4)]
     spread = float(np.mean(stds))
     cert = 1.0 / (1.0 + max(spread, 0.0))
     return 1.0 - cert

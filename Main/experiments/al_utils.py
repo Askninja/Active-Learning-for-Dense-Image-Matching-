@@ -55,7 +55,7 @@ def setup_wandb_run(args, cycle):
         os.environ.pop(var, None)
     mode = "online" if (not args.dont_log_wandb and is_rank0()) else "disabled"
     wandb.init(
-        project='Optical-Depth-New',
+        project=f'ACCV_{args.dataset_name}_dataset',
         entity=args.wandb_entity,
         name=f"{args.job_name}_cycle{cycle}",
         mode=mode,

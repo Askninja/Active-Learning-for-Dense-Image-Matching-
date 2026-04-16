@@ -16,6 +16,11 @@ import roma.strategies.strategy_random               as _s_random
 import roma.strategies.strategy_coreset              as _s_coreset
 import roma.strategies.strategy_entropy              as _s_entropy
 import roma.strategies.strategy_hs_cert              as _s_hs_cert
+import roma.strategies.strategy_hs_cert_new          as _s_hs_cert_new
+import roma.strategies.strategy_hs_cert_3             as _s_hs_cert_3
+import roma.strategies.strategy_combined_diversity   as _s_combined_diversity
+import roma.strategies.strategy_combined_metric_diversity as _s_combined_metric
+import roma.strategies.strategy_uncertainty_metric_diversity as _s_uncertainty_metric
 import roma.strategies.strategy_entropy_weighted_coreset   as _s_entropy_wc
 import roma.strategies.strategy_hs_cert_weighted_coreset   as _s_hs_cert_wc
 import roma.strategies.strategy_geometry_diversity   as _s_geometry
@@ -24,6 +29,11 @@ import roma.strategies.strategy_eigenvalue_diversity as _s_eigen
 import roma.strategies.strategy_displacement_diversity as _s_disp
 import roma.strategies.strategy_combined_eigen_displacement as _s_combined
 import roma.strategies.strategy_hs_cert_weighted_eigenvalue_diversity as _s_hs_eigen
+import roma.strategies.strategy_entropy_weighted_geometric_diversity as _s_entropy_wgd
+import roma.strategies.strategy_hs_cert_weighted_geometric_diversity as _s_hs_cert_wgd
+import roma.strategies.strategy_badge                as _s_badge
+import roma.strategies.hs_cert_delta4_geomdiv       as _s_hs_delta4_geomdiv
+import roma.strategies.strategy_learn_loss          as _s_learn_loss
 import matplotlib
 matplotlib.use("Agg")
 
@@ -54,6 +64,10 @@ class ActiveLearningStrategy:
             if osp.exists(prev_path):
                 self.train_current_idx = np.load(prev_path).astype(int)
         self.rng = np.random.default_rng(int(rng_seed) + self.cycle)
+        # Cache for K RANSAC homographies per pair; populated by
+        # uncertainty_estimation.compute_uncertainty_and_homographies() and
+        # consumed by strategy_geometry_diversity.run().
+        self.homography_sets: dict = {}
         log_strategy_action(
             f"{self.job_name} cycle {self.cycle}: strategy={self.strategy}, "
             f"pool={self.train_pool_idx.size}, preseed={self.preseed_idx.size}, "
@@ -77,9 +91,10 @@ class ActiveLearningStrategy:
         return np.load(path).astype(int)
 
     def _budget_for_cycle(self) -> int:
-        schedule = {0: 10, 1: 20, 2: 20}
-        pct = float(schedule.get(self.cycle, 30)) if self.cycle >= 0 else 0.0
-        return int(np.round(pct / 100.0 * self.train_pool_idx.size))
+        schedule = {0: 10, 1: 10, 2: 10, 3: 20}
+        if self.cycle < 0:
+            return 0
+        return int(schedule.get(self.cycle, 25))
 
     def remaining(self) -> np.ndarray:
         return np.setdiff1d(self.train_pool_idx, self.train_current_idx, assume_unique=True)
@@ -136,10 +151,26 @@ class ActiveLearningStrategy:
         features = feature_pyramid[finest_scale]
         feat_a, feat_b = features.chunk(2, dim=0)
         embedding = torch.cat((feat_a.mean(dim=(2, 3)), feat_b.mean(dim=(2, 3))), dim=1)
-        embedding = embedding / (embedding.norm(dim=1, keepdim=True) + 1e-8)
+        # Returns raw (unnormalized) embedding — normalization is handled by caller.
         return embedding[0].detach().float().cpu().numpy()
 
-    def _compute_fine_feature_embeddings(self, model, avail: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _compute_fine_feature_embeddings(
+        self, model, avail: np.ndarray, normalize: bool = True
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute per-pair appearance embeddings.
+
+        Args:
+            model:     RoMa model.
+            avail:     indices of pairs to embed.
+            normalize: if True (default), L2-normalize each embedding to the
+                       unit sphere before returning — preserves existing
+                       behaviour for all strategies except UWE.
+                       If False, return the raw backbone pooled vectors so
+                       that uncertainty weighting encodes in magnitude.
+
+        Returns:
+            (avail_ids, embeddings) where embeddings is (N, D) float32.
+        """
         dataset = self._entropy_dataset(avail)
         dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
         device = next(model.parameters()).device
@@ -148,10 +179,16 @@ class ActiveLearningStrategy:
         with torch.no_grad():
             for _, batch in zip(avail.astype(int), dataloader):
                 batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
-                embeddings.append(self._pair_embedding_fine(model, batch))
+                emb = self._pair_embedding_fine(model, batch)
+                embeddings.append(emb)
         if not embeddings:
             return np.empty(0, dtype=int), np.empty((0, 0), dtype=np.float32)
-        return avail.astype(int), np.asarray(embeddings, dtype=np.float32)
+        arr = np.asarray(embeddings, dtype=np.float32)
+        if normalize:
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            norms = np.where(norms < 1e-8, 1.0, norms)
+            arr = arr / norms
+        return avail.astype(int), arr
 
     def _compute_geometry_descriptors(self, model, idx_subset: np.ndarray) -> tuple[np.ndarray, torch.Tensor]:
         idx_subset = np.asarray(idx_subset, dtype=int)
@@ -209,23 +246,76 @@ class ActiveLearningStrategy:
             return matches.new_zeros((0, 4)).cpu().numpy()
         return matches[torch.multinomial(cert, num_matches, replacement=False)].cpu().numpy()
 
-    def _compute_hs_uncertainty(self, M, H, W, K=10, P=50):
+    def _get_matches_and_confidences(
+        self, model, pair_id: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run a RoMa forward pass for a single pair and return all dense matches.
+
+        Returns all H×W pixel-space correspondences so that downstream code can
+        apply its own confidence-based filtering (e.g., top-2000 for RANSAC).
+
+        Args:
+            model:   RoMa model.
+            pair_id: pool index of the image pair to process.
+
+        Returns:
+            matches:     (H*W, 4) float32 array [xA, yA, xB, yB] in pixel coords.
+            confidences: (H*W,) float32 array of per-match confidence in [0, 1].
+        """
+        from torch.utils.data import DataLoader
+        dataset = self._entropy_dataset(np.array([pair_id], dtype=int))
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+        device = next(model.parameters()).device
+        model.eval()
+        with torch.no_grad():
+            batch = next(iter(dataloader))
+            batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+            corresps = model(batch)
+            selected_scale = max(corresps.keys())
+            flow = corresps[selected_scale]["flow"]       # (1, 2, H, W)
+            certainty = corresps[selected_scale]["certainty"]  # (1, 1, H, W) or (1, H, W)
+            H_img, W_img = flow.shape[-2:]
+
+            # Build grid of normalized source coords in I_A
+            x_norm = torch.linspace(-1 + 1 / W_img, 1 - 1 / W_img, W_img, device=flow.device)
+            y_norm = torch.linspace(-1 + 1 / H_img, 1 - 1 / H_img, H_img, device=flow.device)
+            yy, xx = torch.meshgrid(y_norm, x_norm, indexing="ij")
+            coords_A_norm = torch.stack((xx, yy), dim=-1)[None]          # (1, H, W, 2)
+            coords_B_norm = coords_A_norm + flow.permute(0, 2, 3, 1)     # (1, H, W, 2)
+
+            # Normalized [-1, 1] → pixel [0, W]:  x_pix = x_norm * W/2 + W/2
+            scale = torch.tensor([W_img / 2.0, H_img / 2.0], device=flow.device)
+            shift = torch.tensor([W_img / 2.0, H_img / 2.0], device=flow.device)
+            coords_A_pix = coords_A_norm * scale + shift
+            coords_B_pix = coords_B_norm * scale + shift
+
+            matches_t = torch.cat([coords_A_pix, coords_B_pix], dim=-1)  # (1, H, W, 4)
+            matches_np = matches_t.reshape(-1, 4).cpu().numpy().astype(np.float32)
+
+            conf = torch.nan_to_num(
+                certainty.sigmoid(), nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp_(0.0, 1.0)
+            conf_np = conf.reshape(-1).cpu().numpy().astype(np.float32)
+
+        return matches_np, conf_np
+
+    def _compute_hs_uncertainty(self, M, H, W, K=50, P=4):
         M_pixel = M * np.array([W/2, H/2, W/2, H/2]) + np.array([W/2, H/2, W/2, H/2])
-        OA_pixel = np.random.rand(P, 2) * np.array([W, H])
-        OA_norm = (OA_pixel - np.array([W/2, H/2])) / np.array([W/2, H/2])
+        # 4 corners of image A in pixel space (paper Sec. IV.B)
+        OA_pixel = np.array([[0, 0], [W, 0], [0, H], [W, H]], dtype=np.float64)
         projections = []
         for _ in range(K):
             subset_size = min(1000, len(M))
             idx = np.random.choice(len(M), subset_size, replace=False)
-            M_k = M[idx] * np.array([W/2, H/2, W/2, H/2]) + np.array([W/2, H/2, W/2, H/2])
+            M_k = M_pixel[idx]
             H_mat, _ = cv2.findHomography(M_k[:, :2], M_k[:, 2:], cv2.RANSAC, 5.0)
             if H_mat is None:
                 H_mat = np.eye(3)
-            OA_hom = np.hstack((OA_norm, np.ones((P, 1))))
+            OA_hom = np.hstack((OA_pixel, np.ones((4, 1))))
             proj_hom = OA_hom @ H_mat.T
             projections.append(proj_hom[:, :2] / proj_hom[:, 2:3])
-        projections = np.array(projections)
-        stds = [np.sqrt(np.std(projections[:, i, 0])**2 + np.std(projections[:, i, 1])**2) for i in range(P)]
+        projections = np.array(projections)  # (K, 4, 2)
+        stds = [0.5 * (np.std(projections[:, i, 0]) + np.std(projections[:, i, 1])) for i in range(4)]
         return 1 - 1 / (1 + np.mean(stds))
 
     def _score_avail(self, model, avail: np.ndarray, score_name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -334,6 +424,21 @@ class ActiveLearningStrategy:
         elif self.strategy == "hs_cert":
             new_idx = _s_hs_cert.run(self, k, model_for_uncertainty)
 
+        elif self.strategy == "hs_cert_new":
+            new_idx = _s_hs_cert_new.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "hs_cert_3":
+            new_idx = _s_hs_cert_3.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "combined_diversity":
+            new_idx = _s_combined_diversity.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "combined_metric_diversity":
+            new_idx = _s_combined_metric.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "uncertainty_metric_diversity":
+            new_idx = _s_uncertainty_metric.run(self, k, model_for_uncertainty)
+
         elif self.strategy == "entropy_weighted_coreset":
             new_idx = _s_entropy_wc.run(self, k, model_for_uncertainty)
 
@@ -357,6 +462,21 @@ class ActiveLearningStrategy:
 
         elif self.strategy == "hs_cert_weighted_eigenvalue_diversity":
             new_idx = _s_hs_eigen.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "entropy_weighted_geometric_diversity":
+            new_idx = _s_entropy_wgd.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "hs_cert_weighted_geometric_diversity":
+            new_idx = _s_hs_cert_wgd.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "hs_cert_delta4_geomdiv":
+            new_idx = _s_hs_delta4_geomdiv.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "badge":
+            new_idx = _s_badge.run(self, k, model_for_uncertainty)
+
+        elif self.strategy == "learn_loss":
+            new_idx = _s_learn_loss.run(self, k, model_for_uncertainty)
 
         else:
             raise ValueError(f"Strategy '{self.strategy}' is not implemented.")

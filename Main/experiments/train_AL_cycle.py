@@ -16,6 +16,13 @@ from roma.losses.robust_loss import RobustLossesAMD, RobustLossesSymmetric
 from roma.train.train import train_k_steps
 from roma.checkpointing import CheckPoint
 from roma.strategies.strategies import ActiveLearningStrategy
+from roma.strategies.strategy_learn_loss import (
+    build_lpm_for_model,
+    find_decoder_penultimate_layer,
+    load_lpm_for_cycle,
+    save_lpm_checkpoint,
+    train_k_steps_learn_loss,
+)
 from experiments.al_utils import (
     is_rank0,
     log_action,
@@ -88,6 +95,7 @@ def train_active_learning(args):
     symmetric = str(args.symmetric) in ("True", "true", "1")
     depth_interpolation_mode = "bilinear"
     needs_selector = args.strategy not in ("preseed", "full", "random")
+    use_learn_loss = args.strategy == "learn_loss"
     start_cycle = max(0, int(getattr(args, "start_cycle", 0)))
     
     
@@ -141,6 +149,13 @@ def train_active_learning(args):
                     log_action(f"[cycle {cycle}] Loading selector weights from {prev_best}.")
                 sel_model.load_state_dict(sel_weights, strict=True)
                 sel_model.eval()
+                if use_learn_loss and cycle > 0:
+                    selector.lpm = load_lpm_for_cycle(
+                        sel_model,
+                        checkpoint_root,
+                        f"{args.job_name}_cycle{cycle-1}",
+                        device_id,
+                    )
                 log_action(f"[cycle {cycle}] Running selector to pick new indices.")
                 selector.get_train_idx(model_for_uncertainty=sel_model)
                 del sel_model
@@ -202,12 +217,26 @@ def train_active_learning(args):
         optimizer = torch.optim.AdamW(parameters, weight_decay=0.01)
         milestones = [int((9 * N / roma.STEP_SIZE) // 10)]
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones)
+        lpm = None
+        optimizer_lpm = None
+        if use_learn_loss:
+            if is_rank0() and cycle == start_cycle:
+                log_action(f"[cycle {cycle}] Decoder hook target: {find_decoder_penultimate_layer(model)}")
+            lpm = build_lpm_for_model(model).to(device_id)
+            optimizer_lpm = torch.optim.Adam(lpm.parameters(), lr=float(args.lpm_lr))
         ddp_model = DDP(
             model,
             device_ids=[device_id],
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
         )
+        if use_learn_loss:
+            lpm = DDP(
+                lpm,
+                device_ids=[device_id],
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+            )
         log_action(f"[cycle {cycle}] Wrapped model with DDP on device {device_id}.")
         grad_scaler = torch.cuda.amp.GradScaler(growth_interval=1_000_000)
         grad_clip_norm = 0.01
@@ -242,17 +271,34 @@ def train_active_learning(args):
                 )
             )
             log_action(f"[cycle {cycle}] Training chunk starting at global step {n}.")
-            train_k_steps(
-                n,
-                k,
-                dataloader_target,
-                ddp_model,
-                depth_loss_target,
-                optimizer,
-                lr_scheduler,
-                grad_scaler,
-                grad_clip_norm=grad_clip_norm,
-            )
+            if use_learn_loss:
+                train_k_steps_learn_loss(
+                    n,
+                    k,
+                    dataloader_target,
+                    ddp_model,
+                    depth_loss_target,
+                    optimizer,
+                    optimizer_lpm,
+                    lr_scheduler,
+                    grad_scaler,
+                    lpm,
+                    grad_clip_norm=grad_clip_norm,
+                    lambda_lpm=float(args.lambda_lpm),
+                    margin=float(args.learn_loss_margin),
+                )
+            else:
+                train_k_steps(
+                    n,
+                    k,
+                    dataloader_target,
+                    ddp_model,
+                    depth_loss_target,
+                    optimizer,
+                    lr_scheduler,
+                    grad_scaler,
+                    grad_clip_norm=grad_clip_norm,
+                )
             ddp_model.eval()
             with torch.no_grad():
                 res_tr = benchmark_train.benchmark(ddp_model.module)
@@ -281,6 +327,7 @@ def train_active_learning(args):
                     }
                 )
                 acc = auc5_ev
+                prev_best = acc_best
                 acc_best = update_checkpoints(
                     checkpointer,
                     ddp_model.module,
@@ -290,6 +337,9 @@ def train_active_learning(args):
                     acc,
                     acc_best,
                 )
+                if use_learn_loss and acc > prev_best:
+                    lpm_path = save_lpm_checkpoint(lpm, checkpoint_root, stem_ckpt)
+                    log_action(f"[cycle {cycle}] Saved best LPM checkpoint to {lpm_path}.")
                 log_action(f"[cycle {cycle}] Checkpoints updated (best AUC5={acc_best:.4f}).")
             ddp_model.train()
             if dist.is_initialized():
@@ -316,6 +366,8 @@ def train_active_learning(args):
             )
         close_wandb_run()
         del ddp_model, model, optimizer, lr_scheduler, target_train
+        if use_learn_loss:
+            del lpm, optimizer_lpm
         torch.cuda.empty_cache()
         if dist.is_initialized():
             dist.barrier()
@@ -376,12 +428,25 @@ def build_argument_parser():
             "displacement_diversity",
             "combined_eigen_displacement",
             "hs_cert_weighted_eigenvalue_diversity",
+            "entropy_weighted_geometric_diversity",
+            "hs_cert_weighted_geometric_diversity",
+            "hs_cert_delta4_geomdiv",
+            "hs_cert_new",
+            "hs_cert_3",
+            "combined_diversity",
+            "combined_metric_diversity",
+            "uncertainty_metric_diversity",
+            "badge",
+            "learn_loss",
         ],
     )
     parser.add_argument("--selector_batch_size", default=8, type=int)
     parser.add_argument("--geometry_hist_bins", default=16, type=int)
     parser.add_argument("--geometry_conf_threshold", default=0.5, type=float)
     parser.add_argument("--geometry_chunk_size", default=2048, type=int)
+    parser.add_argument("--lpm_lr", default=1e-3, type=float)
+    parser.add_argument("--lambda_lpm", default=1.0, type=float)
+    parser.add_argument("--learn_loss_margin", default=1.0, type=float)
     return parser
 
 

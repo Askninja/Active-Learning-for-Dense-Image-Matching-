@@ -63,8 +63,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Directory for CSV and plot outputs.",
     )
     parser.add_argument("--log-level", default="INFO", help="Python logging level.")
-    parser.add_argument("--K", type=int, default=10, help="Number of subsets for geometry estimation.")
-    parser.add_argument("--P", type=int, default=50, help="Number of sampled points for dispersion.")
+    parser.add_argument("--K", type=int, default=50, help="Number of subsets for geometry estimation.")
+    parser.add_argument("--P", type=int, default=4, help="Number of sampled points for dispersion.")
     parser.add_argument("--num-matches", type=int, default=5000, help="Number of matches to sample.")
     return parser.parse_args(argv)
 
@@ -153,44 +153,24 @@ def _get_matches(flow, certainty, H, W, num_matches=5000):
     return M  # (num_matches,4) in [-1,1]
 
 
-def _compute_hs_uncertainty(M, H, W, K=10, P=50):
-    # M (N,4) normalized
-    # convert to pixel
+def _compute_hs_uncertainty(M, H, W, K=50, P=4):
+    # M (N,4) normalized; convert to pixel
     M_pixel = M * np.array([W/2, H/2, W/2, H/2]) + np.array([W/2, H/2, W/2, H/2])
-    kpts_A = M_pixel[:, :2]
-    kpts_B = M_pixel[:, 2:]
-    # sample P points
-    OA_pixel = np.random.rand(P, 2) * np.array([W, H])
-    OA_norm = (OA_pixel - np.array([W/2, H/2])) / np.array([W/2, H/2])
-    # for each k
-    projections = []  # list of (P,2) normalized
+    # 4 corners of image A in pixel space (paper Sec. IV.B)
+    OA_pixel = np.array([[0, 0], [W, 0], [0, H], [W, H]], dtype=np.float64)
+    projections = []
     for _ in range(K):
-        # sample subset, say 1000
         subset_size = min(1000, len(M))
         indices = np.random.choice(len(M), subset_size, replace=False)
-        M_k = M[indices]
-        M_k_pixel = M_k * np.array([W/2, H/2, W/2, H/2]) + np.array([W/2, H/2, W/2, H/2])
-        kpts_A_k = M_k_pixel[:, :2]
-        kpts_B_k = M_k_pixel[:, 2:]
-        # find homography
-        H_mat, mask = cv2.findHomography(kpts_A_k, kpts_B_k, cv2.RANSAC, 5.0)
+        M_k = M_pixel[indices]
+        H_mat, _ = cv2.findHomography(M_k[:, :2], M_k[:, 2:], cv2.RANSAC, 5.0)
         if H_mat is None:
             H_mat = np.eye(3)
-        # project OA
-        OA_hom = np.hstack((OA_norm, np.ones((P,1))))
+        OA_hom = np.hstack((OA_pixel, np.ones((4, 1))))
         proj_hom = OA_hom @ H_mat.T
-        proj_norm = proj_hom[:, :2] / proj_hom[:, 2:3]
-        projections.append(proj_norm)
-    # now projections is list of (P,2)
-    projections = np.array(projections)  # (K, P, 2)
-    # for each i, std of projections[:,i,:]
-    stds = []
-    for i in range(P):
-        points = projections[:, i, :]  # (K,2)
-        std_u = np.std(points[:, 0])
-        std_v = np.std(points[:, 1])
-        std_i = np.sqrt(std_u**2 + std_v**2)
-        stds.append(std_i)
+        projections.append(proj_hom[:, :2] / proj_hom[:, 2:3])
+    projections = np.array(projections)  # (K, 4, 2)
+    stds = [0.5 * (np.std(projections[:, i, 0]) + np.std(projections[:, i, 1])) for i in range(4)]
     s = np.mean(stds)
     c = 1 / (1 + s)
     u = 1 - c
