@@ -1,26 +1,27 @@
-"""HS-Cert-3-weighted geometric diversity: hs_cert_3-scaled geometric descriptors + k-center greedy."""
+"""HS-Cert-3-weighted geometric diversity: hs_cert_3-scaled single-homography descriptors + k-center greedy."""
 
 import numpy as np
-from roma.strategies.strategy_utils import normalize_weights
 from roma.strategies.strategy_utils import k_center_greedy
 from roma.strategies.strategy_utils import log_strategy_action
 from roma.strategies.strategy_hs_cert_3 import _hs_cert_scores
-from roma.strategies.strategy_geometry_diversity import (
-    compute_geometric_diversity,
-    normalize_geometric_descriptors,
+from roma.strategies.hs_cert_delta4_geomdiv import (
+    _compute_single_homography,
+    homography_to_geom_descriptor,
 )
+from roma.strategies.strategy_geometry_diversity import normalize_geometric_descriptors
 
 
 def run(strategy, k: int, model) -> np.ndarray:
     """Select k pairs by hs_cert_3-weighted geometric diversity.
 
     _hs_cert_scores provides certainty scores (low = uncertain) via
-    model.match / model.sample and also populates strategy.homography_sets so
-    geometric descriptors can be built without a second forward pass.
-    Uncertainty weights = 1 - certainty are used to scale the descriptors,
-    biasing k-center greedy toward pairs that are both geometrically novel
-    and uncertain to the model.  When labeled pairs exist the greedy search
-    is seeded from their (unweighted) descriptors.
+    model.match / model.sample (one forward pass per pair).  The geometric
+    descriptor is built from a single benchmark-style homography fitted via
+    _get_matches_and_confidences (a second forward pass per pair — unavoidable
+    without refactoring _hs_cert_scores).  Raw uncertainty weights = 1 - certainty
+    ∈ [0, 1] scale the descriptors, biasing k-center greedy toward pairs that are
+    both geometrically novel and uncertain to the model.  When labeled pairs exist
+    the greedy search is seeded from their unweighted descriptors.
 
     Args:
         strategy: ActiveLearningStrategy instance.
@@ -35,73 +36,50 @@ def run(strategy, k: int, model) -> np.ndarray:
         return np.empty(0, dtype=int)
     k = min(int(k), avail.size)
 
-    # hs_cert_3 certainty scores + populates strategy.homography_sets
+    # _hs_cert_scores uses model.match + model.sample (forward pass 1 per pair)
     hs_cert = _hs_cert_scores(strategy, model, avail)
-    uncertainties = 1.0 - hs_cert          # high = uncertain
-    valid_ids = avail
+    uncertainties_all = 1.0 - hs_cert   # raw weights in [0, 1]
+
+    image_size = int(getattr(strategy, "_image_size", 560))
+
+    # Per-pair descriptor loop uses _get_matches_and_confidences (forward pass 2 per pair)
+    G_raw_list = []
+    valid_positions = []   # indices into avail / uncertainties_all
+    valid_ids = []
+    for i, pair_id in enumerate(avail.tolist()):
+        try:
+            matches, confs = strategy._get_matches_and_confidences(model, int(pair_id))
+        except Exception as exc:
+            log_strategy_action(
+                f"HS-Cert-3-weighted geometric diversity: skipping pair {pair_id} — "
+                f"match extraction failed: {exc}"
+            )
+            continue
+        H = _compute_single_homography(matches, confs, image_size=image_size)
+        G_raw_list.append(homography_to_geom_descriptor(H, image_size=image_size))
+        valid_positions.append(i)
+        valid_ids.append(int(pair_id))
+
+    if not valid_ids:
+        return np.empty(0, dtype=int)
+
+    valid_ids = np.asarray(valid_ids, dtype=int)
+    G_raw_unlabeled = np.asarray(G_raw_list, dtype=np.float64)
+    # Align uncertainty weights with the pairs that produced valid descriptors
+    uncertainties = uncertainties_all[np.asarray(valid_positions, dtype=int)].astype(np.float32)
     N_u = valid_ids.size
     k = min(k, N_u)
 
-    # Build geometric descriptors from cached homographies
-    G_raw_unlabeled = np.zeros((N_u, 8), dtype=np.float64)
-    for i, pid in enumerate(valid_ids.tolist()):
-        h_list = strategy.homography_sets.get(int(pid), [])
-        G_raw_unlabeled[i] = compute_geometric_diversity(h_list, image_size=560)
+    G_norm_unlabeled = normalize_geometric_descriptors(G_raw_unlabeled)
 
-    # Labeled pairs for normalization + seeding
-    labeled_idx = strategy.train_current_idx
-    G_raw_labeled = None
-    N_l = 0
-
-    if labeled_idx.size > 0:
-        try:
-            _hs_cert_scores(strategy, model, labeled_idx)  # populates homography_sets for labeled
-            N_l = labeled_idx.size
-            G_raw_labeled = np.zeros((N_l, 8), dtype=np.float64)
-            for i, pid in enumerate(labeled_idx.tolist()):
-                h_list = strategy.homography_sets.get(int(pid), [])
-                G_raw_labeled[i] = compute_geometric_diversity(h_list, image_size=560)
-        except Exception as exc:
-            log_strategy_action(
-                f"HS-Cert-3-weighted geometric diversity: could not compute labeled descriptors ({exc}); "
-                "normalizing on unlabeled pool only."
-            )
-            G_raw_labeled = None
-            N_l = 0
-
-    # Robust normalization across the combined pool
-    if G_raw_labeled is not None and N_l > 0:
-        G_raw_all = np.concatenate([G_raw_labeled, G_raw_unlabeled], axis=0)
-        G_norm_all = normalize_geometric_descriptors(G_raw_all)
-        G_norm_unlabeled = G_norm_all[N_l:]
-        G_norm_labeled = G_norm_all[:N_l]
-    else:
-        G_norm_unlabeled = normalize_geometric_descriptors(G_raw_unlabeled)
-        G_norm_labeled = None
-
-    # Scale unlabeled descriptors by hs_cert_3 uncertainty weights
-    G_weighted = (G_norm_unlabeled * normalize_weights(uncertainties)[:, None]).astype(np.float32)
     log_strategy_action(
         f"HS-Cert-3-weighted geometric diversity: weighting {N_u} descriptors by hs_cert_3."
     )
 
-    # k-center greedy with labeled seeding (unweighted labeled descriptors as seeds)
-    if G_norm_labeled is not None and N_l > 0:
-        log_strategy_action(
-            f"HS-Cert-weighted geometric diversity: seeding k-center from {N_l} labeled pairs."
-        )
-        G_combined = np.concatenate([G_norm_labeled.astype(np.float32), G_weighted], axis=0)
-        initial_idx = np.arange(N_l, dtype=int)
-        total_needed = min(N_l + k, N_l + N_u)
-        all_selected = k_center_greedy(G_combined, total_needed, initial_idx=initial_idx)
-        unlabeled_pos = np.array(
-            [idx - N_l for idx in all_selected if idx >= N_l], dtype=int
-        )[:k]
-    else:
-        unlabeled_pos = k_center_greedy(G_weighted, k)
+    G_weighted = (G_norm_unlabeled * uncertainties[:, None]).astype(np.float32)
+    unlabeled_pos = k_center_greedy(G_weighted, k)
 
     log_strategy_action(
-        f"HS-Cert-3-weighted geometric diversity: {N_l} labeled, {N_u} unlabeled, "
-        f"selected {unlabeled_pos.size} samples."
+        f"HS-Cert-3-weighted geometric diversity: {N_u} unlabeled, selected {unlabeled_pos.size} samples."
     )
     return valid_ids[unlabeled_pos].astype(int)

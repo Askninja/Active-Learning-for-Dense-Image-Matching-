@@ -4,7 +4,7 @@ from pathlib import Path
 SEED = 11012005
 COUNTS = (130, 30, 30, 10)
 NUM_SAMPLES = sum(COUNTS)
-DATA_ROOT = Path(__file__).resolve().parents[2] / 'datasets' / 'cross_modality' / 'Nighttime' / 'Idx_files'
+DATA_ROOT = Path(__file__).resolve().parents[2] / 'datasets' / 'cross_modality' / 'Optical-Depth' / 'Idx_files'
 
 
 def main() -> None:

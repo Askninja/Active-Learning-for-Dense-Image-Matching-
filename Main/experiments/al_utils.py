@@ -11,7 +11,8 @@ DATASET_DIRS = {
     "Optical-Depth": "cross_modality/Optical-Depth",
     "Optical-Optical": "cross_modality/Optical-Optical",
     "Nighttime": "cross_modality/Nighttime",
-    "Map-Data": "cross_modality/Map-Data"
+    "Map-Data": "cross_modality/Map-Data",
+    "Optical-SAR": "cross_modality/Optical-SAR"
 }
 
 def is_rank0():
@@ -55,7 +56,7 @@ def setup_wandb_run(args, cycle):
         os.environ.pop(var, None)
     mode = "online" if (not args.dont_log_wandb and is_rank0()) else "disabled"
     wandb.init(
-        project=f'ACCV_{args.dataset_name}_dataset',
+        project=f'ACCV_{args.dataset_name}_dataset_best',
         entity=args.wandb_entity,
         name=f"{args.job_name}_cycle{cycle}",
         mode=mode,

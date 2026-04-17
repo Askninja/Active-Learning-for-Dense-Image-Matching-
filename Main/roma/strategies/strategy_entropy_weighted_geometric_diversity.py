@@ -1,26 +1,25 @@
-"""Entropy-weighted geometric diversity: entropy-scaled geometric descriptors + k-center greedy."""
+"""Entropy-weighted geometric diversity: entropy-scaled single-homography descriptors + k-center greedy."""
 
 import numpy as np
-from roma.strategies.strategy_utils import normalize_weights
 from roma.strategies.strategy_utils import k_center_greedy
 from roma.strategies.strategy_utils import log_strategy_action
-from roma.strategies.uncertainty_estimation import compute_uncertainty_and_homographies
-from roma.strategies.strategy_geometry_diversity import (
-    compute_geometric_diversity,
-    normalize_geometric_descriptors,
+from roma.strategies.hs_cert_delta4_geomdiv import (
+    _compute_single_homography,
+    homography_to_geom_descriptor,
 )
+from roma.strategies.strategy_geometry_diversity import normalize_geometric_descriptors
 
 
 def run(strategy, k: int, model) -> np.ndarray:
     """Select k pairs by entropy-weighted geometric diversity.
 
     Entropy scores each pair by the mean GM classifier entropy (same as the
-    standalone entropy strategy).  Geometric descriptors are built from K=50
-    RANSAC homographies (same as the standalone geometry_diversity strategy).
-    The normalized 8-dim descriptors are then scaled by entropy weights before
-    k-center greedy, biasing selection toward pairs that are both geometrically
-    novel and uncertain to the model.  When labeled pairs exist the greedy
-    search is seeded from their descriptors.
+    standalone entropy strategy).  A single benchmark-style homography is fitted
+    per pair to build the 8D corner-displacement descriptor.  Both signals are
+    computed together in a per-pair loop so entropy scores and descriptors stay
+    aligned without a separate intersection step.  The normalized descriptors are
+    scaled by raw entropy weights ∈ [0, 1] before k-center greedy.  When labeled
+    pairs exist the greedy search is seeded from their unweighted descriptors.
 
     Args:
         strategy: ActiveLearningStrategy instance.
@@ -35,90 +34,54 @@ def run(strategy, k: int, model) -> np.ndarray:
         return np.empty(0, dtype=int)
     k = min(int(k), avail.size)
 
-    # Entropy scores — identical to standalone entropy strategy
+    # Entropy scores for the full available pool (batch call)
     score_ids, score_values = strategy._score_avail(model, avail, score_name="entropy")
     if score_values.shape[0] == 0:
         return np.empty(0, dtype=int)
-
-    # Homographies — identical to standalone geometry_diversity strategy
-    _u, _c, _h, valid_unlabeled_ids = compute_uncertainty_and_homographies(strategy, model, avail)
-    if valid_unlabeled_ids.size == 0:
-        return np.empty(0, dtype=int)
-
-    # Intersect: keep only pairs that have both a valid entropy score and homographies
     score_map = {int(idx): float(s) for idx, s in zip(score_ids.tolist(), score_values.tolist())}
-    valid_ids = np.array(
-        [idx for idx in valid_unlabeled_ids.tolist() if int(idx) in score_map], dtype=int
-    )
-    if valid_ids.size == 0:
-        return np.empty(0, dtype=int)
-    k = min(k, valid_ids.size)
-    N_u = valid_ids.size
 
-    # Build geometric descriptors from cached homographies
-    G_raw_unlabeled = np.zeros((N_u, 8), dtype=np.float64)
-    for i, pid in enumerate(valid_ids.tolist()):
-        h_list = strategy.homography_sets.get(int(pid), [])
-        G_raw_unlabeled[i] = compute_geometric_diversity(h_list, image_size=560)
+    image_size = int(getattr(strategy, "_image_size", 560))
 
-    # Labeled pairs for normalization + seeding
-    labeled_idx = strategy.train_current_idx
-    G_raw_labeled = None
-    N_l = 0
-
-    if labeled_idx.size > 0:
+    # Per-pair loop: compute descriptor and align entropy score together.
+    # Pairs missing from score_map or failing match extraction are skipped.
+    G_raw_list = []
+    entropy_aligned = []
+    valid_ids = []
+    for pair_id in avail.tolist():
+        if int(pair_id) not in score_map:
+            continue
         try:
-            _u_l, _c_l, _h_l, valid_labeled_ids = compute_uncertainty_and_homographies(
-                strategy, model, labeled_idx
-            )
-            if valid_labeled_ids.size > 0:
-                N_l = valid_labeled_ids.size
-                G_raw_labeled = np.zeros((N_l, 8), dtype=np.float64)
-                for i, pid in enumerate(valid_labeled_ids.tolist()):
-                    h_list = strategy.homography_sets.get(int(pid), [])
-                    G_raw_labeled[i] = compute_geometric_diversity(h_list, image_size=560)
+            matches, confs = strategy._get_matches_and_confidences(model, int(pair_id))
         except Exception as exc:
             log_strategy_action(
-                f"Entropy-weighted geometric diversity: could not compute labeled descriptors ({exc}); "
-                "normalizing on unlabeled pool only."
+                f"Entropy-weighted geometric diversity: skipping pair {pair_id} — "
+                f"match extraction failed: {exc}"
             )
-            G_raw_labeled = None
-            N_l = 0
+            continue
+        H = _compute_single_homography(matches, confs, image_size=image_size)
+        G_raw_list.append(homography_to_geom_descriptor(H, image_size=image_size))
+        entropy_aligned.append(score_map[int(pair_id)])
+        valid_ids.append(int(pair_id))
 
-    # Robust normalization across the combined pool
-    if G_raw_labeled is not None and N_l > 0:
-        G_raw_all = np.concatenate([G_raw_labeled, G_raw_unlabeled], axis=0)
-        G_norm_all = normalize_geometric_descriptors(G_raw_all)
-        G_norm_unlabeled = G_norm_all[N_l:]
-        G_norm_labeled = G_norm_all[:N_l]
-    else:
-        G_norm_unlabeled = normalize_geometric_descriptors(G_raw_unlabeled)
-        G_norm_labeled = None
+    if not valid_ids:
+        return np.empty(0, dtype=int)
 
-    # Scale unlabeled descriptors by entropy weights
-    aligned = np.asarray([score_map[int(idx)] for idx in valid_ids.tolist()], dtype=np.float32)
-    G_weighted = (G_norm_unlabeled * normalize_weights(aligned)[:, None]).astype(np.float32)
+    valid_ids = np.asarray(valid_ids, dtype=int)
+    G_raw_unlabeled = np.asarray(G_raw_list, dtype=np.float64)
+    entropy_aligned = np.asarray(entropy_aligned, dtype=np.float32)
+    N_u = valid_ids.size
+    k = min(k, N_u)
+
+    G_norm_unlabeled = normalize_geometric_descriptors(G_raw_unlabeled)
+
     log_strategy_action(
         f"Entropy-weighted geometric diversity: weighting {N_u} descriptors by entropy."
     )
 
-    # k-center greedy with labeled seeding (unweighted labeled descriptors as seeds)
-    if G_norm_labeled is not None and N_l > 0:
-        log_strategy_action(
-            f"Entropy-weighted geometric diversity: seeding k-center from {N_l} labeled pairs."
-        )
-        G_combined = np.concatenate([G_norm_labeled.astype(np.float32), G_weighted], axis=0)
-        initial_idx = np.arange(N_l, dtype=int)
-        total_needed = min(N_l + k, N_l + N_u)
-        all_selected = k_center_greedy(G_combined, total_needed, initial_idx=initial_idx)
-        unlabeled_pos = np.array(
-            [idx - N_l for idx in all_selected if idx >= N_l], dtype=int
-        )[:k]
-    else:
-        unlabeled_pos = k_center_greedy(G_weighted, k)
+    G_weighted = (G_norm_unlabeled * entropy_aligned[:, None]).astype(np.float32)
+    unlabeled_pos = k_center_greedy(G_weighted, k)
 
     log_strategy_action(
-        f"Entropy-weighted geometric diversity: {N_l} labeled, {N_u} unlabeled, "
-        f"selected {unlabeled_pos.size} samples."
+        f"Entropy-weighted geometric diversity: {N_u} unlabeled, selected {unlabeled_pos.size} samples."
     )
     return valid_ids[unlabeled_pos].astype(int)

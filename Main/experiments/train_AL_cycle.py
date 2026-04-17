@@ -49,7 +49,7 @@ DATASET_DIRS = {
     "Optical-Depth": "cross_modality/Optical-Depth",
     "Optical-Optical": "cross_modality/Optical-Optical",
     "Nighttime": "cross_modality/Nighttime",
-    "Map-Data": "cross_modality/Map-Data"
+    "Optical-SAR": "cross_modality/Optical-SAR"
 }
 
 

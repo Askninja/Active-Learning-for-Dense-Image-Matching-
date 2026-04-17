@@ -1,20 +1,16 @@
 """Geometry diversity strategy: k-center greedy on corner displacement descriptors.
 
 Each image pair is represented by an 8-dimensional descriptor g(x) containing
-the normalized displacement of the four image corners. Pairs are then
-selected to cover the geometric diversity of the unlabeled pool using k-center
-greedy, seeded from already-labeled pairs when available.
-
-Homographies are obtained via ``uncertainty_estimation.compute_uncertainty_and_homographies``
-and cached on the strategy object, so a prior hs_cert pass in a combined strategy
-incurs no extra forward passes here.
+the normalized displacement of the four image corners computed from a single
+benchmark-style homography (same pipeline as hs_cert_delta4_geomdiv).  Pairs
+are then selected to cover the geometric diversity of the unlabeled pool using
+k-center greedy, seeded from already-labeled pairs when available.
 """
 
 import numpy as np
 from typing import List, Optional
 from roma.strategies.strategy_utils import k_center_greedy
 from roma.strategies.strategy_utils import log_strategy_action
-from roma.strategies.uncertainty_estimation import compute_uncertainty_and_homographies
 
 
 # ---------------------------------------------------------------------------
@@ -145,43 +141,57 @@ def select_geometric_diversity(
 def run(strategy, k: int, model) -> np.ndarray:
     """Run the geometry_diversity strategy.
 
-    For each unlabeled image pair, K=50 RANSAC homographies are obtained via
-    ``compute_uncertainty_and_homographies`` (which also populates
-    ``strategy.homography_sets`` for combined-strategy reuse). An 8-dimensional
-    displacement descriptor is built from the mean homography, then k-center greedy
-    selects the most geometrically diverse subset.  If labeled pairs are available
-    their descriptors are included in the normalization and seed the greedy search.
+    For each unlabeled image pair a single benchmark-style homography is fitted
+    from the highest-confidence matches (same pipeline as hs_cert_delta4_geomdiv).
+    An 8-dimensional corner-displacement descriptor is built from that homography,
+    then k-center greedy selects the most geometrically diverse subset.  If labeled
+    pairs are available their descriptors are included in the normalization and seed
+    the greedy search.
 
     Args:
         strategy: ActiveLearningStrategy instance.
         k:        number of samples to select.
-        model:    RoMa model used to compute matches for RANSAC homographies.
+        model:    RoMa model used to compute matches.
 
     Returns:
         (k,) selected pool indices.
     """
+    # Deferred import to break the circular dependency with hs_cert_delta4_geomdiv,
+    # which itself imports normalize_geometric_descriptors from this module.
+    from roma.strategies.hs_cert_delta4_geomdiv import (  # noqa: PLC0415
+        _compute_single_homography,
+        homography_to_geom_descriptor,
+    )
+
     avail = strategy.remaining()
     if avail.size == 0 or k <= 0:
         return np.empty(0, dtype=int)
     k = min(int(k), avail.size)
 
-    # --- Populate strategy.homography_sets for the unlabeled pool ---
-    # If a prior hs_cert pass already filled the cache for these pairs,
-    # compute_uncertainty_and_homographies is still called but the model
-    # forward passes are cheap relative to the RANSAC work.
-    _u, _c, _h, valid_unlabeled_ids = compute_uncertainty_and_homographies(
-        strategy, model, avail
-    )
-    if valid_unlabeled_ids.size == 0:
+    image_size = int(getattr(strategy, "_image_size", 560))
+
+    # --- Build single-homography descriptors for the unlabeled pool ---
+    G_raw_list = []
+    valid_unlabeled_ids = []
+    for pair_id in avail.tolist():
+        try:
+            matches, confs = strategy._get_matches_and_confidences(model, int(pair_id))
+        except Exception as exc:
+            log_strategy_action(
+                f"Geometry diversity: skipping pair {pair_id} — match extraction failed: {exc}"
+            )
+            continue
+        H = _compute_single_homography(matches, confs, image_size=image_size)
+        G_raw_list.append(homography_to_geom_descriptor(H, image_size=image_size))
+        valid_unlabeled_ids.append(int(pair_id))
+
+    if not valid_unlabeled_ids:
         return np.empty(0, dtype=int)
 
+    valid_unlabeled_ids = np.asarray(valid_unlabeled_ids, dtype=int)
+    G_raw_unlabeled = np.asarray(G_raw_list, dtype=np.float64)
     N_u = valid_unlabeled_ids.size
-
-    # --- Build g_raw for each unlabeled pair from the cached homographies ---
-    G_raw_unlabeled = np.zeros((N_u, 8), dtype=np.float64)
-    for i, pid in enumerate(valid_unlabeled_ids.tolist()):
-        h_list = strategy.homography_sets.get(int(pid), [])
-        G_raw_unlabeled[i] = compute_geometric_diversity(h_list, image_size=560)
+    k = min(k, N_u)
 
     # --- Optionally include labeled pairs in normalization ---
     labeled_idx = strategy.train_current_idx
@@ -190,15 +200,20 @@ def run(strategy, k: int, model) -> np.ndarray:
 
     if labeled_idx.size > 0:
         try:
-            _u_l, _c_l, _h_l, valid_labeled_ids = compute_uncertainty_and_homographies(
-                strategy, model, labeled_idx
-            )
-            if valid_labeled_ids.size > 0:
-                N_l = valid_labeled_ids.size
-                G_raw_labeled = np.zeros((N_l, 8), dtype=np.float64)
-                for i, pid in enumerate(valid_labeled_ids.tolist()):
-                    h_list = strategy.homography_sets.get(int(pid), [])
-                    G_raw_labeled[i] = compute_geometric_diversity(h_list, image_size=560)
+            G_raw_l_list = []
+            for pair_id in labeled_idx.tolist():
+                try:
+                    matches, confs = strategy._get_matches_and_confidences(model, int(pair_id))
+                except Exception as exc:
+                    log_strategy_action(
+                        f"Geometry diversity: skipping labeled pair {pair_id} — match extraction failed: {exc}"
+                    )
+                    continue
+                H = _compute_single_homography(matches, confs, image_size=image_size)
+                G_raw_l_list.append(homography_to_geom_descriptor(H, image_size=image_size))
+            if G_raw_l_list:
+                N_l = len(G_raw_l_list)
+                G_raw_labeled = np.asarray(G_raw_l_list, dtype=np.float64)
         except Exception as exc:
             log_strategy_action(
                 f"Geometry diversity: could not compute labeled descriptors ({exc}); "
