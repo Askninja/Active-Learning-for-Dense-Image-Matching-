@@ -1,1 +1,2 @@
 from .opticalmap_homog_benchmark import OpticalmapHomogBenchmark
+from .metu_vistir_flat_benchmark import METUVisTIRFlatBenchmark as METUVisTIRBenchmark

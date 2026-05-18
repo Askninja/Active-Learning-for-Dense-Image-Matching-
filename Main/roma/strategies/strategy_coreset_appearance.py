@@ -45,25 +45,17 @@ def run(strategy, k: int, model) -> np.ndarray:
     k = min(int(k), avail.size)
     sample_ids, embeddings = strategy._compute_fine_feature_embeddings(model, avail)
     if embeddings.shape[0] == 0:
-        return np.empty(0, dtype=int)
-
-    # L2-normalize unlabeled embeddings (same as coreset_appearance does internally)
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms < 1e-8, 1.0, norms)
-    norm_embeddings = (embeddings / norms).astype(np.float32)
+        raise ValueError(f"strategy_coreset_appearance: no embeddings produced for avail={avail}")
 
     labeled_idx = strategy.train_current_idx
     if labeled_idx.size > 0:
         try:
             lab_ids, lab_embeddings = strategy._compute_fine_feature_embeddings(model, labeled_idx)
             if lab_embeddings.shape[0] > 0:
-                lab_norms = np.linalg.norm(lab_embeddings, axis=1, keepdims=True)
-                lab_norms = np.where(lab_norms < 1e-8, 1.0, lab_norms)
-                norm_lab_embeddings = (lab_embeddings / lab_norms).astype(np.float32)
                 log_strategy_action(
                     f"Coreset appearance: seeding k-center from {len(lab_ids)} labeled pairs."
                 )
-                combined = np.concatenate([norm_lab_embeddings, norm_embeddings], axis=0)
+                combined = np.concatenate([lab_embeddings, embeddings], axis=0)
                 initial_idx = np.arange(len(lab_ids), dtype=int)
                 total_needed = min(len(lab_ids) + k, len(lab_ids) + len(sample_ids))
                 all_selected = k_center_greedy(
@@ -82,6 +74,6 @@ def run(strategy, k: int, model) -> np.ndarray:
                 f"Coreset appearance: labeled embedding failed ({exc}); falling back to unseeded."
             )
 
-    selected_pos = k_center_greedy(norm_embeddings, k)
+    selected_pos = k_center_greedy(embeddings, k)
     log_strategy_action(f"Coreset appearance: selected {len(selected_pos)} from {len(sample_ids)} candidates.")
     return sample_ids[selected_pos].astype(int)

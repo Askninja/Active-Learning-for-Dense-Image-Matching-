@@ -1,24 +1,61 @@
 """Geometry diversity strategy: k-center greedy on corner displacement descriptors.
 
-Each image pair is represented by an 8-dimensional descriptor g(x) containing
-the normalized displacement of the four image corners computed from a single
-benchmark-style homography (same pipeline as hs_cert_delta4_geomdiv).  Pairs
-are then selected to cover the geometric diversity of the unlabeled pool using
-k-center greedy, seeded from already-labeled pairs when available.
+Each image pair is represented by an 8-dimensional descriptor g(x) computed by
+averaging displacement vectors across K=50 RANSAC homographies (mathematically
+valid: averages in R^8 displacement space, not in homography matrix space).
+Pairs are selected to cover the geometric diversity of the unlabeled pool using
+k-center greedy, no labeled-set seeding.
 """
 
 import numpy as np
-from typing import List, Optional
-from roma.strategies.strategy_utils import k_center_greedy
-from roma.strategies.strategy_utils import log_strategy_action
+from typing import Optional
+from roma.strategies.strategy_utils import (
+    k_center_greedy,
+    log_strategy_action,
+)
 
 
 # ---------------------------------------------------------------------------
-# Per-pair descriptor
+# Per-pair descriptor (averaged displacement vectors, K=50 RANSAC runs)
 # ---------------------------------------------------------------------------
+
+def homography_to_geom_descriptor(H: np.ndarray, image_size: int = 560) -> np.ndarray:
+    """Map image corners through H and return the 8-D corner-displacement vector."""
+    s = float(image_size)
+    corners = np.array([[0.0, 0.0], [s - 1, 0.0], [s - 1, s - 1], [0.0, s - 1]], dtype=np.float64)
+    corners_h = np.concatenate([corners, np.ones((4, 1), dtype=np.float64)], axis=1)
+    warped_h = (H @ corners_h.T).T
+    denom = warped_h[:, 2:3]
+    denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+    warped = warped_h[:, :2] / denom
+    delta = (warped - corners) / s
+    delta = np.clip(delta, -3.0, 3.0)
+    return delta.reshape(-1)
+
+
+def compute_geometric_diversity_from_homographies(
+    homographies: list,
+    image_size: int = 560,
+) -> np.ndarray:
+    """Average displacement vectors across K valid homographies.
+
+    Mathematically valid: averages in R^8 displacement space,
+    not in homography matrix space.
+    """
+    displacements = []
+    for H in homographies:
+        if H is None:
+            continue
+        d = homography_to_geom_descriptor(H, image_size=image_size)
+        if np.any(d != 0):
+            displacements.append(d)
+    if len(displacements) < 3:
+        return np.zeros(8, dtype=np.float64)
+    return np.mean(np.stack(displacements, axis=0), axis=0)
+
 
 def compute_geometric_diversity(
-    homographies: List[Optional[np.ndarray]],
+    homographies: list[Optional[np.ndarray]],
     image_size: int = 560,
 ) -> np.ndarray:
     """Compute an 8-dimensional geometric diversity descriptor for one image pair.
@@ -32,45 +69,7 @@ def compute_geometric_diversity(
         (8,) descriptor g_raw(x). Returns np.zeros(8) when fewer than 3 valid
         homographies are present.
     """
-    # Step 1: filter out failed RANSAC runs
-    valid = [H for H in homographies if H is not None]
-
-    # Step 2: degenerate case — not enough homographies to be meaningful
-    if len(valid) < 3:
-        return np.zeros(8, dtype=np.float64)
-
-    # Step 3: mean homography in R^{3x3}
-    mu = np.mean(np.stack(valid, axis=0), axis=0)  # (3, 3)
-
-    s = float(image_size)
-
-    # Step 4: four corners of I_A in homogeneous coordinates
-    #   [0,0,1], [W,0,1], [0,H,1], [W,H,1]
-    corners_hom = np.array([
-        [0., 0., 1.],
-        [s,  0., 1.],
-        [0., s,  1.],
-        [s,  s,  1.],
-    ], dtype=np.float64)  # (4, 3)
-
-    # Step 5 & 6: project each corner through mu, compute normalized displacement
-    deltas = []
-    for o in corners_hom:
-        p = mu @ o                                    # (3,)
-        denom = p[2] if abs(p[2]) >= 1e-10 else 1e-10
-        p_cart = p[:2] / denom                        # (2,) Cartesian
-        delta = (p_cart - o[:2]) / s                  # normalized displacement
-        # Clip to avoid extreme outliers from near-singular homographies
-        delta = np.clip(delta, -3.0, 3.0)
-        deltas.append(delta)
-
-    # Step 7: d(x) = [delta_1, delta_2, delta_3, delta_4] ∈ R^8
-    g_raw = np.concatenate(deltas)  # (8,)
-
-    # Step 8: replace any NaN / Inf with 0
-    g_raw = np.where(np.isfinite(g_raw), g_raw, 0.0)
-
-    return g_raw
+    return compute_geometric_diversity_from_homographies(homographies, image_size=image_size)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +98,6 @@ def normalize_geometric_descriptors(G: np.ndarray) -> np.ndarray:
         med = np.median(col)
         iqr = float(np.percentile(col, 75) - np.percentile(col, 25))
         if iqr < 1e-8:
-            # Constant dimension — zero it out to avoid numerical blow-up
             G_norm[:, j] = 0.0
         else:
             G_norm[:, j] = (col - med) / iqr
@@ -113,25 +111,17 @@ def normalize_geometric_descriptors(G: np.ndarray) -> np.ndarray:
 def select_geometric_diversity(
     G_norm: np.ndarray,
     b: int,
-    already_selected: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Select b indices from the unlabeled pool via k-center greedy.
 
-    If already_selected is provided (indices into a combined array where the
-    first len(already_selected) rows correspond to labeled pairs), the greedy
-    search is seeded from those rows so that selected points are also diverse
-    relative to the labeled set.
-
     Args:
-        G_norm:           (N, 8) normalized descriptors for the unlabeled pool.
-        b:                number of samples to select.
-        already_selected: optional (M,) indices into the embedding matrix that
-                          should be treated as already chosen (used for seeding).
+        G_norm: (N, 8) normalized descriptors for the unlabeled pool.
+        b:      number of samples to select.
 
     Returns:
-        (b,) selected indices into G_norm (i.e., into the unlabeled pool).
+        (b,) selected indices into G_norm.
     """
-    return k_center_greedy(G_norm.astype(np.float32), b, initial_idx=already_selected)
+    return k_center_greedy(G_norm.astype(np.float32), b)
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +131,11 @@ def select_geometric_diversity(
 def run(strategy, k: int, model) -> np.ndarray:
     """Run the geometry_diversity strategy.
 
-    For each unlabeled image pair a single benchmark-style homography is fitted
-    from the highest-confidence matches (same pipeline as hs_cert_delta4_geomdiv).
-    An 8-dimensional corner-displacement descriptor is built from that homography,
-    then k-center greedy selects the most geometrically diverse subset.  If labeled
-    pairs are available their descriptors are included in the normalization and seed
-    the greedy search.
+    K=50 RANSAC homographies are computed per pair via _hs_cert_scores (which
+    populates strategy.homography_sets as a side effect).  An 8-dimensional
+    descriptor is built by averaging displacement vectors across those K valid
+    homographies.  k-center greedy selects the most geometrically diverse subset.
+    No labeled-set seeding. Normalization over unlabeled pool only.
 
     Args:
         strategy: ActiveLearningStrategy instance.
@@ -156,12 +145,7 @@ def run(strategy, k: int, model) -> np.ndarray:
     Returns:
         (k,) selected pool indices.
     """
-    # Deferred import to break the circular dependency with hs_cert_delta4_geomdiv,
-    # which itself imports normalize_geometric_descriptors from this module.
-    from roma.strategies.hs_cert_delta4_geomdiv import (  # noqa: PLC0415
-        _compute_single_homography,
-        homography_to_geom_descriptor,
-    )
+    from roma.strategies.strategy_hs_cert_3 import _hs_cert_scores  # noqa: PLC0415
 
     avail = strategy.remaining()
     if avail.size == 0 or k <= 0:
@@ -170,20 +154,23 @@ def run(strategy, k: int, model) -> np.ndarray:
 
     image_size = int(getattr(strategy, "_image_size", 560))
 
-    # --- Build single-homography descriptors for the unlabeled pool ---
+    # Populate strategy.homography_sets with K=50 RANSAC homographies per pair
+    _hs_cert_scores(strategy, model, avail)
+
     G_raw_list = []
     valid_unlabeled_ids = []
     for pair_id in avail.tolist():
-        try:
-            matches, confs = strategy._get_matches_and_confidences(model, int(pair_id))
-        except Exception as exc:
+        d = compute_geometric_diversity_from_homographies(
+            strategy.homography_sets.get(int(pair_id), []),
+            image_size=image_size,
+        )
+        if np.any(d != 0):
+            G_raw_list.append(d)
+            valid_unlabeled_ids.append(int(pair_id))
+        else:
             log_strategy_action(
-                f"Geometry diversity: skipping pair {pair_id} — match extraction failed: {exc}"
+                f"Geometry diversity: skipping pair {pair_id} — zero/degenerate descriptor."
             )
-            continue
-        H = _compute_single_homography(matches, confs, image_size=image_size)
-        G_raw_list.append(homography_to_geom_descriptor(H, image_size=image_size))
-        valid_unlabeled_ids.append(int(pair_id))
 
     if not valid_unlabeled_ids:
         return np.empty(0, dtype=int)
@@ -193,73 +180,13 @@ def run(strategy, k: int, model) -> np.ndarray:
     N_u = valid_unlabeled_ids.size
     k = min(k, N_u)
 
-    # --- Optionally include labeled pairs in normalization ---
-    labeled_idx = strategy.train_current_idx
-    G_raw_labeled = None
-    N_l = 0
+    # Normalize over unlabeled pool only
+    G_norm_unlabeled = normalize_geometric_descriptors(G_raw_unlabeled)
 
-    if labeled_idx.size > 0:
-        try:
-            G_raw_l_list = []
-            for pair_id in labeled_idx.tolist():
-                try:
-                    matches, confs = strategy._get_matches_and_confidences(model, int(pair_id))
-                except Exception as exc:
-                    log_strategy_action(
-                        f"Geometry diversity: skipping labeled pair {pair_id} — match extraction failed: {exc}"
-                    )
-                    continue
-                H = _compute_single_homography(matches, confs, image_size=image_size)
-                G_raw_l_list.append(homography_to_geom_descriptor(H, image_size=image_size))
-            if G_raw_l_list:
-                N_l = len(G_raw_l_list)
-                G_raw_labeled = np.asarray(G_raw_l_list, dtype=np.float64)
-        except Exception as exc:
-            log_strategy_action(
-                f"Geometry diversity: could not compute labeled descriptors ({exc}); "
-                "normalizing on unlabeled pool only."
-            )
-            G_raw_labeled = None
-            N_l = 0
-
-    # --- Robust normalization across the combined pool ---
-    if G_raw_labeled is not None and N_l > 0:
-        G_raw_all = np.concatenate([G_raw_labeled, G_raw_unlabeled], axis=0)  # (N_l + N_u, 8)
-        G_norm_all = normalize_geometric_descriptors(G_raw_all)
-        G_norm_unlabeled = G_norm_all[N_l:]   # (N_u, 8)
-        G_norm_labeled   = G_norm_all[:N_l]   # (N_l, 8)
-    else:
-        G_norm_unlabeled = normalize_geometric_descriptors(G_raw_unlabeled)
-        G_norm_labeled = None
-
-    # --- k-center greedy selection ---
-    # When labeled descriptors exist, combine them so that k_center_greedy
-    # computes initial min-distances relative to the already-labeled set.
-    if G_norm_labeled is not None and N_l > 0:
-        G_combined = np.concatenate([G_norm_labeled, G_norm_unlabeled], axis=0)
-        initial_idx = np.arange(N_l, dtype=int)
-        total_needed = min(N_l + k, N_l + N_u)
-        all_selected = k_center_greedy(
-            G_combined.astype(np.float32), total_needed, initial_idx=initial_idx
-        )
-        # Keep only indices that fall in the unlabeled block [N_l, N_l + N_u)
-        unlabeled_pos = np.array(
-            [idx - N_l for idx in all_selected if idx >= N_l], dtype=int
-        )[:k]
-        if unlabeled_pos.size < k:
-            # Top up from remaining uncovered pool positions
-            covered = set(unlabeled_pos.tolist())
-            extras = [i for i in range(N_u) if i not in covered]
-            unlabeled_pos = np.concatenate([
-                unlabeled_pos,
-                np.asarray(extras[:k - unlabeled_pos.size], dtype=int),
-            ])
-    else:
-        log_strategy_action("Geometry diversity: no labeled descriptors; using k-center greedy.")
-        unlabeled_pos = select_geometric_diversity(G_norm_unlabeled, k)
+    # k-center greedy on unlabeled pool, no seeding
+    unlabeled_pos = select_geometric_diversity(G_norm_unlabeled, k)
 
     log_strategy_action(
-        f"Geometry diversity: {N_l} labeled, {N_u} unlabeled, "
-        f"descriptor_dim=8, selected {unlabeled_pos.size} samples."
+        f"Geometry diversity: {N_u} unlabeled, descriptor_dim=8, selected {unlabeled_pos.size} samples."
     )
     return valid_unlabeled_ids[unlabeled_pos].astype(int)

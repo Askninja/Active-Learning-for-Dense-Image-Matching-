@@ -1,228 +1,136 @@
 #!/usr/bin/env python3
 """
-Create paired Optical-SAR dataset with visible affine transforms.
+Generate paired Optical-SAR dataset with ground-truth 3x3 homography matrices.
 
-Requirements implemented:
-- pairN_1.jpg = Nth image in sorted optical folder
-- pairN_2.jpg = Nth image in sorted SAR folder after transform
-- Indexes match by sorted order position (NOT basename intersection)
-- No forced grayscale conversion (preserve original color/channels)
-- Do NOT fill empty rotated areas:
-    borderMode = BORDER_CONSTANT (black empty regions)
-- Save gt_N.txt = 2x3 affine matrix
-- Output images resized to 256x256 if needed
+Outputs per pair:
+  pairN_1.jpg  -> optical image
+  pairN_2.jpg  -> warped SAR image
+  gt_N.txt     -> 3x3 homography matrix H_AB
 """
 
-from __future__ import annotations
-
-import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# =====================================================
-# CONFIG
-# =====================================================
+# ── Hardcoded paths ────────────────────────────────────────────────────
+OPT_DIR = Path("/projects/ALData/SAR/QXSLAB_SAROPT/opt_256_oc_0.2")
+SAR_DIR = Path("/projects/ALData/SAR/QXSLAB_SAROPT/sar_256_oc_0.2")
+OUT_DIR = Path("/home/abhiram001/Active-Learning-for-Dense-Image-Matching-/datasets/cross_modality/Optical-SAR")
+
+RHO         = 64    # max corner perturbation in pixels (rho = image_size / 4)
+SEED        = 42
+MAX_SAMPLES = None  # set to an int to limit, e.g. 5000
+
 ACCEPTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
-DEFAULT_OPT_DIR = Path("/projects/ALData/SAR/QXSLAB_SAROPT/opt_256_oc_0.2")
-DEFAULT_SAR_DIR = Path("/projects/ALData/SAR/QXSLAB_SAROPT/sar_256_oc_0.2")
-DEFAULT_OUT_DIR = Path(
-    "/home/abhiram001/Active-Learning-for-Dense-Image-Matching-/datasets/cross_modality/Optical-SAR"
-)
 
-TARGET_SIZE = (256, 256)  # (width, height)
-
-
-# =====================================================
-# CLI
-# =====================================================
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--opt_dir", type=Path, default=DEFAULT_OPT_DIR)
-    parser.add_argument("--sar_dir", type=Path, default=DEFAULT_SAR_DIR)
-    parser.add_argument("--out_dir", type=Path, default=DEFAULT_OUT_DIR)
-
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--overwrite", action="store_true")
-
-    return parser.parse_args()
-
-
-# =====================================================
-# FILE COLLECTION (INDEX MATCHING BY ORDER)
-# =====================================================
 def collect_sorted(folder: Path) -> List[Path]:
-    if not folder.is_dir():
-        raise FileNotFoundError(f"Folder not found: {folder}")
-
-    files = sorted(
+    return sorted(
         p for p in folder.iterdir()
         if p.is_file() and p.suffix.lower() in ACCEPTED_EXTS
     )
-    return files
 
 
-# =====================================================
-# LOAD IMAGE (COLOR, NO GRAYSCALE)
-# =====================================================
-def load_image(path: Path):
+def load_image(path: Path) -> np.ndarray:
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-
     if img is None:
-        raise RuntimeError(f"Failed to read: {path}")
-
-    h, w = img.shape[:2]
-
-    if (w, h) != TARGET_SIZE:
-        interp = cv2.INTER_AREA if (w > TARGET_SIZE[0] or h > TARGET_SIZE[1]) else cv2.INTER_LINEAR
-        img = cv2.resize(img, TARGET_SIZE, interpolation=interp)
-
+        raise RuntimeError(f"Cannot read: {path}")
     return img
 
 
-# =====================================================
-# RANDOM AFFINE
-# =====================================================
-def random_affine_matrix(rng, width=256, height=256):
-    rotation_deg = rng.uniform(-75, 75)
-    tx = rng.uniform(-60, 60)
-    ty = rng.uniform(-60, 60)
-    scale = rng.uniform(0.80, 1.30)
-    shear_deg = rng.uniform(-18, 18)
+def generate_pair(
+    image_A: np.ndarray,
+    image_B: np.ndarray,
+    rng: np.random.Generator,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Returns (image_A, warped_image_B, H_AB_3x3) or None if degenerate.
+    """
+    h, w = image_A.shape[:2]
 
-    theta = np.deg2rad(rotation_deg)
-    shear = np.deg2rad(shear_deg)
+    if image_B.shape[:2] != (h, w):
+        image_B = cv2.resize(image_B, (w, h))
 
-    cx = (width - 1) / 2.0
-    cy = (height - 1) / 2.0
+    # 4 corners of the full image: TL, TR, BR, BL
+    corners_A = np.array([
+        [0,     0    ],
+        [w - 1, 0    ],
+        [w - 1, h - 1],
+        [0,     h - 1],
+    ], dtype=np.float32)
 
-    to_origin = np.array([
-        [1, 0, -cx],
-        [0, 1, -cy],
-        [0, 0, 1]
-    ], dtype=np.float64)
+    # Random perturbation in [-rho, rho] per corner per axis
+    deltas    = rng.integers(-RHO, RHO + 1, size=(4, 2)).astype(np.float32)
+    corners_B = corners_A + deltas
 
-    back = np.array([
-        [1, 0, cx],
-        [0, 1, cy],
-        [0, 0, 1]
-    ], dtype=np.float64)
+    # H_AB from exact 4-point correspondences
+    H_AB = cv2.getPerspectiveTransform(corners_A, corners_B)
+    if H_AB is None:
+        return None
+    H_AB = H_AB / H_AB[2, 2]
 
-    T = np.array([
-        [1, 0, tx],
-        [0, 1, ty],
-        [0, 0, 1]
-    ], dtype=np.float64)
+    # Warp SAR with H_BA = inv(H_AB)
+    H_BA = np.linalg.inv(H_AB)
+    H_BA = H_BA / H_BA[2, 2]
 
-    S = np.array([
-        [scale, 0, 0],
-        [0, scale, 0],
-        [0, 0, 1]
-    ], dtype=np.float64)
+    warped_B = cv2.warpPerspective(
+        image_B, H_BA, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
 
-    R = np.array([
-        [np.cos(theta), -np.sin(theta), 0],
-        [np.sin(theta),  np.cos(theta), 0],
-        [0, 0, 1]
-    ], dtype=np.float64)
-
-    Sh = np.array([
-        [1, np.tan(shear), 0],
-        [0, 1, 0],
-        [0, 0, 1]
-    ], dtype=np.float64)
-
-    M = T @ back @ Sh @ R @ S @ to_origin
-
-    return M[:2, :]
+    return image_A, warped_B, H_AB.astype(np.float64)
 
 
-# =====================================================
-# SAVE MATRIX
-# =====================================================
-def save_matrix(path: Path, matrix):
-    np.savetxt(str(path), matrix, fmt="%.8f")
-
-
-# =====================================================
-# MAIN
-# =====================================================
 def main():
-    args = parse_args()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    opt_files = collect_sorted(args.opt_dir)
-    sar_files = collect_sorted(args.sar_dir)
+    opt_files = collect_sorted(OPT_DIR)
+    sar_files = collect_sorted(SAR_DIR)
 
     total = min(len(opt_files), len(sar_files))
+    if MAX_SAMPLES:
+        total = min(total, MAX_SAMPLES)
 
-    if args.max_samples is not None:
-        total = min(total, args.max_samples)
-
-    rng = np.random.default_rng(args.seed)
-
+    rng     = np.random.default_rng(SEED)
     written = 0
-    skipped = 0
+
+    print(f"Generating {total} pairs | rho={RHO}px | out={OUT_DIR}")
 
     for i in range(total):
-        idx = i + 1
-
-        opt_path = opt_files[i]
-        sar_path = sar_files[i]
-
-        out1 = args.out_dir / f"pair{idx}_1.jpg"
-        out2 = args.out_dir / f"pair{idx}_2.jpg"
-        gt = args.out_dir / f"gt_{idx}.txt"
-
-        if (
-            not args.overwrite
-            and out1.exists()
-            and out2.exists()
-            and gt.exists()
-        ):
-            skipped += 1
-            continue
+        idx   = i + 1
+        out_A = OUT_DIR / f"pair{idx}_1.jpg"
+        out_B = OUT_DIR / f"pair{idx}_2.jpg"
+        out_H = OUT_DIR / f"gt_{idx}.txt"
 
         try:
-            optical = load_image(opt_path)
-            sar = load_image(sar_path)
-
-            M = random_affine_matrix(rng, 256, 256)
-
-            warped = cv2.warpAffine(
-                sar,
-                M,
-                TARGET_SIZE,
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0
+            result = generate_pair(
+                load_image(opt_files[i]),
+                load_image(sar_files[i]),
+                rng=rng,
             )
-
-            cv2.imwrite(str(out1), optical, [cv2.IMWRITE_JPEG_QUALITY, 100])
-            cv2.imwrite(str(out2), warped, [cv2.IMWRITE_JPEG_QUALITY, 100])
-
-            save_matrix(gt, M)
-
-            written += 1
-
         except Exception as e:
-            print(f"skip {idx}: {e}")
-            skipped += 1
+            print(f"  [error {idx}] {e}")
+            continue
 
-        if idx % 100 == 0:
-            print(f"{idx}/{total} processed | written={written} skipped={skipped}")
+        if result is None:
+            print(f"  [skip  {idx}] degenerate homography")
+            continue
 
-    print("----- SUMMARY -----")
-    print("optical files :", len(opt_files))
-    print("sar files     :", len(sar_files))
-    print("pairs made    :", total)
-    print("written       :", written)
-    print("skipped       :", skipped)
+        img_A, img_B, H_AB = result
+
+        cv2.imwrite(str(out_A), img_A, [cv2.IMWRITE_JPEG_QUALITY, 100])
+        cv2.imwrite(str(out_B), img_B, [cv2.IMWRITE_JPEG_QUALITY, 100])
+        np.savetxt(str(out_H), H_AB, fmt="%.10f")
+
+        written += 1
+        if idx % 200 == 0:
+            print(f"  {idx}/{total} done")
+
+    print(f"\nDone. written={written}  out={OUT_DIR}")
 
 
 if __name__ == "__main__":

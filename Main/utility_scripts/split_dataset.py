@@ -1,42 +1,39 @@
 import numpy as np
 from pathlib import Path
 
-SEED = 11012005
-COUNTS = (130, 30, 30, 10)
-NUM_SAMPLES = sum(COUNTS)
-DATA_ROOT = Path(__file__).resolve().parents[2] / 'datasets' / 'cross_modality' / 'Optical-Depth' / 'Idx_files'
+# ── hard-coded parameters ─────────────────────────────────────────────────────
+SEED         = 110105
+TRAIN_SIZE   = 130
+TEST_SIZE    = 30
+VAL_SIZE     = 30
+PRESEED_SIZE = 10
+
+DATASET_NAME = "Optical-Optical"
+
+NUM_SAMPLES  = TRAIN_SIZE + TEST_SIZE + VAL_SIZE + PRESEED_SIZE
+
+DATA_ROOT = Path("/projects/ALData/Active_Datasets/cross_modality") / DATASET_NAME / "Idx_files"
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
-    rng = np.random.default_rng(SEED)
+    rng   = np.random.default_rng(SEED)
     total = rng.permutation(np.arange(1, NUM_SAMPLES + 1))
-    preseed_path = DATA_ROOT / 'preseed_idx.npy'
 
-    if preseed_path.is_file():
-        # Reuse the preseed split so previously trained checkpoints stay aligned.
-        preseed = np.load(preseed_path).astype(int)
-        if preseed.size != COUNTS[3]:
-            raise ValueError(f"Existing preseed has {preseed.size} samples; expected {COUNTS[3]}")
-    else:
-        preseed = total[-COUNTS[3]:]
-
-    remaining = total[~np.isin(total, preseed)]
-    expected_remaining = sum(COUNTS[:3])
-    if remaining.size != expected_remaining:
-        raise ValueError(f"Expected {expected_remaining} remaining samples, got {remaining.size}")
-
-    train = remaining[:COUNTS[0]]
-    test = remaining[COUNTS[0]:COUNTS[0] + COUNTS[1]]
-    val = remaining[COUNTS[0] + COUNTS[1]:COUNTS[0] + COUNTS[1] + COUNTS[2]]
+    preseed = total[:PRESEED_SIZE]
+    train   = total[PRESEED_SIZE : PRESEED_SIZE + TRAIN_SIZE]
+    test    = total[PRESEED_SIZE + TRAIN_SIZE : PRESEED_SIZE + TRAIN_SIZE + TEST_SIZE]
+    val     = total[PRESEED_SIZE + TRAIN_SIZE + TEST_SIZE :]
 
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    np.save(DATA_ROOT / 'train_idx.npy', train)
-    np.save(DATA_ROOT / 'test_idx.npy', test)
-    np.save(DATA_ROOT / 'val_idx.npy', val)
-    np.save(DATA_ROOT / 'preseed_idx.npy', preseed)
 
-    print(train.size, test.size, val.size, preseed.size)
+    np.save(DATA_ROOT / "train.npy",   train)
+    np.save(DATA_ROOT / "test.npy",    test)
+    np.save(DATA_ROOT / "val.npy",     val)
+    np.save(DATA_ROOT / "preseed.npy", preseed)
+
+    print(f"train={train.size}  test={test.size}  val={val.size}  preseed={preseed.size}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

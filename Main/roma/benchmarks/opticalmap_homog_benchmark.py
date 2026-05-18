@@ -99,6 +99,58 @@ class OpticalmapHomogBenchmark:
         score = float(std_xy.mean())
         return score
 
+    # def benchmark_raw(self, model, idx_subset=None, thresh_score=0.05):
+    #     """Returns (homog_dists, all_epe) for idx_subset without aggregation."""
+    #     indices = self.test_idx if idx_subset is None else idx_subset
+    #     homog_dists = []
+    #     all_epe = []
+    #     for idx in indices:
+    #         optical_path = os.path.join(self.data_root, f'pair{idx}_1.jpg')
+    #         map_path = os.path.join(self.data_root, f'pair{idx}_2.jpg')
+    #         homo = np.loadtxt(os.path.join(self.data_root, f'gt_{idx}.txt'))
+    #         if homo.shape[0] == 2:
+    #             homo = np.vstack([homo, np.array([0, 0, 1])])
+    #         H_gt = torch.tensor(homo, dtype=torch.float)
+    #         im_A = self.load_im(optical_path)
+    #         w1, h1 = im_A.size
+    #         im_B = self.load_im(map_path)
+    #         w2, h2 = im_B.size
+    #         dense_matches, dense_certainty = model.match(optical_path, map_path)
+    #         sparse_matches, _ = model.sample(dense_matches, dense_certainty, 5000, thresh_score=thresh_score)
+    #         sparse_matches_np = sparse_matches.cpu().numpy()
+    #         pos_a, pos_b = self.convert_coordinates(
+    #             sparse_matches_np[:, :2], sparse_matches_np[:, 2:], w1, h1, w2, h2
+    #         )
+    #         try:
+    #             H_pred, _ = cv2.findHomography(
+    #                 pos_a, pos_b, method=cv2.RANSAC, confidence=0.99999,
+    #                 ransacReprojThreshold=3 * min(w2, h2) / 480,
+    #             )
+    #         except Exception:
+    #             H_pred = None
+    #         if H_pred is None:
+    #             H_pred = np.zeros((3, 3))
+    #             H_pred[2, 2] = 1.0
+    #         corners = np.array([[0, 0, 1], [0, h1-1, 1], [w1-1, h1-1, 1], [w1-1, 0, 1]])
+    #         real_warped_corners = np.dot(corners, np.transpose(H_gt))
+    #         real_warped_corners = real_warped_corners[:, :2] / real_warped_corners[:, 2:]
+    #         warped_corners = np.dot(corners, np.transpose(H_pred))
+    #         warped_corners = warped_corners[:, :2] / warped_corners[:, 2:]
+    #         mean_dist = np.mean(np.linalg.norm(real_warped_corners - warped_corners, axis=1)) / (min(w2, h2) / 480.0)
+    #         homog_dists.append(mean_dist)
+    #         dense_matches_np = dense_matches.reshape(-1, 4).cpu().numpy()
+    #         dense_a, dense_b = self.convert_coordinates(
+    #             dense_matches_np[:, :2], dense_matches_np[:, 2:], w1, h1, w2, h2
+    #         )
+    #         w_dense_a = np.dot(
+    #             np.concatenate([dense_a, np.ones_like(dense_a[:, 0:1])], axis=1),
+    #             np.transpose(H_gt),
+    #         )
+    #         w_dense_a = w_dense_a / w_dense_a[:, 2:]
+    #         epe = np.mean(np.linalg.norm(w_dense_a[:, :2] - dense_b, axis=1)) / (min(w2, h2) / 480.0)
+    #         all_epe.append(epe)
+    #     return homog_dists, all_epe
+
     def benchmark(self, model, model_name=None, vis=False, thresh_score=0.05):
         homog_dists = []
         all_epe = []

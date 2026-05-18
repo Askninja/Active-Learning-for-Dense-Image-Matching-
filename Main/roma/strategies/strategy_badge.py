@@ -142,9 +142,9 @@ def compute_badge_embedding(
     token_count = height * width
     logits_tokens = logits.permute(0, 2, 3, 1).reshape(batch_size, token_count, n_classes)
     probs = torch.softmax(logits_tokens, dim=-1)
-    pseudo_labels = logits_tokens.detach().argmax(dim=-1, keepdim=True)
-    residuals = probs.clone()
-    residuals.scatter_add_(-1, pseudo_labels, torch.full_like(pseudo_labels, -1, dtype=probs.dtype))
+    pseudo_labels = logits_tokens.detach().argmax(dim=-1)
+    one_hot = torch.nn.functional.one_hot(pseudo_labels, num_classes=n_classes).to(dtype=probs.dtype)
+    residuals = probs - one_hot
     residuals = residuals[0] / float(token_count)   # (T, C)
     token_features = features[0]                    # (T, D)
 
@@ -171,19 +171,28 @@ def kmeans_plus_plus(
         return np.arange(num_points, dtype=int)
 
     center_indices = [int(rng.integers(0, num_points))]
+    selected_mask = np.zeros(num_points, dtype=bool)
+    selected_mask[center_indices[0]] = True
     min_sq_dists = np.sum((embeddings - embeddings[center_indices[0]]) ** 2, axis=1, dtype=np.float64)
     min_sq_dists[center_indices[0]] = 0.0
 
     for _ in range(k - 1):
+        min_sq_dists[selected_mask] = 0.0
         total = float(min_sq_dists.sum())
         if total < 1e-12:
-            remaining = np.setdiff1d(np.arange(num_points, dtype=int), np.asarray(center_indices, dtype=int))
+            remaining = np.flatnonzero(~selected_mask)
             if remaining.size == 0:
                 break
             next_center = int(rng.choice(remaining))
         else:
             next_center = int(rng.choice(num_points, p=min_sq_dists / total))
+            if selected_mask[next_center]:
+                remaining = np.flatnonzero(~selected_mask)
+                if remaining.size == 0:
+                    break
+                next_center = int(remaining[0])
         center_indices.append(next_center)
+        selected_mask[next_center] = True
         sq_dists = np.sum((embeddings - embeddings[next_center]) ** 2, axis=1, dtype=np.float64)
         np.minimum(min_sq_dists, sq_dists, out=min_sq_dists)
         min_sq_dists[next_center] = 0.0

@@ -40,6 +40,7 @@ def _hs_cert_scores(strategy, model_for_uncertainty, avail: np.ndarray) -> np.nd
         strategy.homography_sets = {}
 
     hs_vals = []
+    g = np.random.default_rng(1234)
     for i in avail:
         a_path, b_path = _resolve_pair_paths(strategy.data_root, int(i))
         dense_matches, dense_certainty = model_for_uncertainty.match(a_path, b_path)
@@ -49,7 +50,7 @@ def _hs_cert_scores(strategy, model_for_uncertainty, avail: np.ndarray) -> np.nd
         sm = sparse_matches.detach().cpu().numpy()
         if sm.shape[0] < 8:
             strategy.homography_sets[int(i)] = []
-            hs_vals.append(0.0)
+            hs_vals.append(np.inf)
             continue
         with Image.open(a_path) as imA:
             w1, h1 = imA.size
@@ -57,7 +58,6 @@ def _hs_cert_scores(strategy, model_for_uncertainty, avail: np.ndarray) -> np.nd
             w2, h2 = imB.size
         A_px = np.stack((w1 * (sm[:, 0] + 1) / 2 - 0.5, h1 * (sm[:, 1] + 1) / 2 - 0.5), axis=1)
         B_px = np.stack((w2 * (sm[:, 2] + 1) / 2 - 0.5, h2 * (sm[:, 3] + 1) / 2 - 0.5), axis=1)
-        g = np.random.default_rng(1234)
         Hs = []
         subset = min(2000, A_px.shape[0])
         thresh = 3 * min(w2, h2) / 480
@@ -75,16 +75,74 @@ def _hs_cert_scores(strategy, model_for_uncertainty, avail: np.ndarray) -> np.nd
                 Hs.append(H / (H[2, 2] + 1e-12))
         strategy.homography_sets[int(i)] = Hs
         if len(Hs) < 2:
-            hs_vals.append(0.0)
+            hs_vals.append(np.inf)
             continue
         Hs_stack = np.stack(Hs, axis=0)
-        c = np.float32([[0, 0], [w1 - 1, 0], [w1 - 1, h1 - 1], [0, h1 - 1]]).reshape(-1, 1, 2)
-        warped = np.stack([cv2.perspectiveTransform(c, H).reshape(4, 2) for H in Hs_stack], axis=0)
+        corners = np.array([[0.0, 0.0], [w1 - 1, 0.0], [w1 - 1, h1 - 1], [0.0, h1 - 1]], dtype=np.float64)
+        corners_h = np.concatenate([corners, np.ones((4, 1), dtype=np.float64)], axis=1)  # (4, 3)
+        def _project(H):
+            w = (H @ corners_h.T).T          # (4, 3)
+            denom = w[:, 2:3]
+            denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+            return (w[:, :2] / denom)        # (4, 2)
+        warped = np.stack([_project(H) for H in Hs_stack], axis=0)
         s = float(warped.std(axis=0).mean())
         hs_vals.append(s)
     hs_vals = np.asarray(hs_vals, dtype=float)
     hs_cert = 1.0 / (1.0 + np.maximum(hs_vals, 0.0))
     return hs_cert
+
+
+def hs_cert_from_homography_sets(strategy, pair_ids: np.ndarray) -> np.ndarray:
+    """Compute hs_cert from already-cached homography_sets — no forward pass needed.
+
+    Uses the same spread formula as _hs_cert_scores but reads from
+    strategy.homography_sets instead of running RANSAC again.  Pairs with
+    fewer than 2 valid homographies get cert=0 (maximally uncertain).
+
+    Args:
+        strategy: ActiveLearningStrategy instance (must have homography_sets populated).
+        pair_ids: (N,) int array of pair indices to score.
+
+    Returns:
+        (N,) float32 hs_cert values in (0, 1].
+    """
+    from pathlib import Path
+
+    root = Path(strategy.data_root)
+    hs_vals = []
+    for pid in pair_ids.tolist():
+        Hs = strategy.homography_sets.get(int(pid), [])
+        if len(Hs) < 2:
+            hs_vals.append(np.inf)
+            continue
+
+        for ext in (".jpg", ".png", ".jpeg", ".JPG", ".PNG", ".JPEG"):
+            candidate = root / f"pair{pid}_1{ext}"
+            if candidate.exists():
+                from PIL import Image
+                with Image.open(candidate) as im:
+                    w1, h1 = im.size
+                break
+        else:
+            hs_vals.append(np.inf)
+            continue
+
+        Hs_stack = np.stack(Hs, axis=0)
+        corners = np.array([[0.0, 0.0], [w1 - 1, 0.0], [w1 - 1, h1 - 1], [0.0, h1 - 1]], dtype=np.float64)
+        corners_h = np.concatenate([corners, np.ones((4, 1), dtype=np.float64)], axis=1)
+
+        def _project(H):
+            w = (H @ corners_h.T).T
+            denom = w[:, 2:3]
+            denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+            return w[:, :2] / denom
+
+        warped = np.stack([_project(H) for H in Hs_stack], axis=0)
+        hs_vals.append(float(warped.std(axis=0).mean()))
+
+    hs_vals = np.asarray(hs_vals, dtype=float)
+    return (1.0 / (1.0 + np.maximum(hs_vals, 0.0))).astype(np.float32)
 
 
 def run(strategy, k: int, model) -> np.ndarray:

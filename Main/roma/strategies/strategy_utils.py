@@ -10,6 +10,30 @@ def log_strategy_action(message: str):
 
 
 # ---------------------------------------------------------------------------
+# Entropy utilities (certainty-map based)
+# ---------------------------------------------------------------------------
+
+_LOG2 = math.log(2.0)
+
+
+def binary_entropy_score(certainty_logits: torch.Tensor) -> float:
+    """Mean binary entropy of a certainty logit map.
+
+    For each pixel: H(x) = -(p·log₂p + (1-p)·log₂(1-p)) where p = sigmoid(logit).
+    Returns the spatial mean, normalized to [0, 1].
+
+    Args:
+        certainty_logits: tensor of any shape containing pre-sigmoid certainty logits.
+
+    Returns:
+        Scalar float in [0, 1].  1.0 = maximally uncertain (p=0.5 everywhere).
+    """
+    p = torch.sigmoid(certainty_logits).clamp(1e-6, 1.0 - 1e-6)
+    h = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p)) / _LOG2
+    return float(h.mean().item())
+
+
+# ---------------------------------------------------------------------------
 # Homography utilities
 # ---------------------------------------------------------------------------
 
@@ -151,21 +175,21 @@ def k_center_greedy(
 
 
 def normalize_weights(values: np.ndarray) -> np.ndarray:
-    """Map scores to weights in [1, 2] for uncertainty-weighted selection.
+    """Normalize scores to [0, 1] for uncertainty-weighted selection.
 
     Args:
         values: (N,) scalar scores.
 
     Returns:
-        (N,) weights in [1, 2].
+        (N,) weights in [0, 1].
     """
     values = np.asarray(values, dtype=np.float32)
     if values.size == 0:
         return values
     vmin, vmax = float(values.min()), float(values.max())
     if vmax - vmin < 1e-8:
-        return np.ones_like(values, dtype=np.float32)
-    return 1.0 + (values - vmin) / (vmax - vmin)
+        return np.zeros_like(values, dtype=np.float32)
+    return (values - vmin) / (vmax - vmin)
 
 
 # ---------------------------------------------------------------------------
